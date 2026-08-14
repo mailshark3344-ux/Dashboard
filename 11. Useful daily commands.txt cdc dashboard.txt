@@ -1,0 +1,24 @@
+11. Useful daily commands
+Start everything
+cd D:\Avani\cdc-dashboard
+docker compose up -d
+
+Check containers
+docker ps
+
+Watch worker
+docker logs -f cdc-python-worker
+
+Restart worker
+docker restart cdc-python-worker
+
+Rebuild worker after changing Python code
+docker compose up -d --build cdc-python-worker
+
+Check worker's actual Python file
+Useful when you're unsure whether Docker has the latest code:
+
+docker exec cdc-python-worker sh -c "grep -n 'Existing CDC events' worker.py"
+
+Check PostgreSQL
+docker exec -it cdc-postgres psql -U redash -d redash

@@ -1,0 +1,5 @@
+Host:     host.docker.internal
+Port:     5433
+Database: redash
+User:     redash
+Password: redashpass
