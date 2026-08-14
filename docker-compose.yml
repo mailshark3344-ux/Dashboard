@@ -1,0 +1,76 @@
+services:
+
+  postgres:
+    image: postgres:16
+    container_name: cdc-postgres
+    environment:
+      POSTGRES_DB: redash
+      POSTGRES_USER: redash
+      POSTGRES_PASSWORD: redashpass
+    volumes:
+      - ./postgres:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: cdc-redis
+    restart: unless-stopped
+
+  redash:
+    image: redash/redash:26.3.0
+    container_name: cdc-redash
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      # Redash uses the separate metadata database
+      REDASH_DATABASE_URL: postgresql://redash:redashpass@postgres:5432/redash_metadata
+      REDASH_REDIS_URL: redis://redis:6379/0
+      REDASH_COOKIE_SECRET: cdc-dashboard-secret
+      REDASH_SECRET_KEY: cdc-dashboard-secret
+    ports:
+      - "5001:5000"
+    restart: unless-stopped
+
+  redash-worker:
+    image: redash/redash:26.3.0
+    container_name: cdc-redash-worker
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      # Worker must use the same Redash metadata database
+      REDASH_DATABASE_URL: postgresql://redash:redashpass@postgres:5432/redash_metadata
+      REDASH_REDIS_URL: redis://redis:6379/0
+      REDASH_COOKIE_SECRET: cdc-dashboard-secret
+      REDASH_SECRET_KEY: cdc-dashboard-secret
+    command: worker
+    restart: unless-stopped
+
+  python-worker:
+    build:
+      context: ./python
+    container_name: cdc-python-worker
+    depends_on:
+      - postgres
+    environment:
+      # MinIO
+      MINIO_ENDPOINT: http://host.docker.internal:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin123
+      MINIO_BUCKET: myfiles
+      MINIO_PREFIX: cdc/
+
+      # CDC database
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: redash
+      POSTGRES_USER: redash
+      POSTGRES_PASSWORD: redashpass
+
+      # Check MinIO every 10 seconds
+      POLL_INTERVAL: 10
+
+    restart: unless-stopped
