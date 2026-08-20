@@ -12,3 +12,66 @@ Port        5432
 User       redash
 Password    redashpass
 Database    redash
+
+
+
+Exactly. Your Docker MinIO uses non-default host ports:
+
+MinIO API:     http://localhost:9100
+MinIO Console: http://localhost:9101
+
+
+
+So after a PC restart
+
+Run:
+
+cd D:\Avani\cdc-dashboard
+docker compose up -d
+
+
+Then check:
+
+docker compose ps
+
+Open MinIO
+
+Use:
+
+MinIO Console
+
+Login:
+
+Username: minioadmin
+Password: minioadmin123
+
+Open Redash
+
+Redash
+
+Check the worker
+docker logs cdc-python-worker --tail 50
+
+
+Or continuously monitor it:
+
+docker logs -f cdc-python-worker
+
+Your final startup cheat sheet
+
+After restarting your computer:
+
+cd D:\Avani\cdc-dashboard
+docker compose up -d
+docker compose ps
+
+
+Then:
+
+Component	Address
+Redash	http://localhost:5000
+MinIO Console	http://localhost:9101
+MinIO API	http://localhost:9100
+Python worker	Runs automatically in Docker
+PostgreSQL	localhost:5433
+
