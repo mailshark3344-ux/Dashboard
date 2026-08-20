@@ -3,3 +3,12 @@ Port:     5433
 Database: redash
 User:     redash
 Password: redashpass
+
+
+20-08-2026
+Name        CDC PostgreSQL
+Host        cdc-postgres
+Port        5432
+User       redash
+Password    redashpass
+Database    redash
