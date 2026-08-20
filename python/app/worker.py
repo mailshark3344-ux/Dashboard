@@ -34,9 +34,28 @@ MINIO_BUCKET = os.getenv(
     "myfiles"
 )
 
+# IMPORTANT:
+#
+# Your actual objects currently look like:
+#
+# cdc data/cdc/cdc_001.csv
+# cdc data/cdc/cdc_003.csv
+#
+# Therefore your Docker environment should use:
+#
+# MINIO_PREFIX="cdc data/"
+#
+# If you later upload objects under normal:
+#
+# cdc/cdc_001.csv
+#
+# change this to:
+#
+# MINIO_PREFIX="cdc/"
+#
 MINIO_PREFIX = os.getenv(
     "MINIO_PREFIX",
-    "cdc/"
+    "cdc data/"
 )
 
 POLL_INTERVAL = int(
@@ -73,23 +92,27 @@ POSTGRES_PASSWORD = os.getenv(
     "redashpass"
 )
 
-# ------------------------------------------------------------
+
+# ============================================================
 # FORCE REPROCESS
+# ============================================================
 #
 # Set:
 #
 # FORCE_REPROCESS=true
 #
-# if you want every supported MinIO file to be rebuilt on
-# every scan.
+# if you want every supported MinIO file to be rebuilt
+# on every scan.
 #
-# Default is false.
+# Normally leave this false.
 #
-# IMPORTANT:
-# Even when false, this worker automatically repairs a file
-# when processed_files says it was processed but cdc_events
-# contains ZERO events for that file.
-# ------------------------------------------------------------
+# The worker automatically repairs files where:
+#
+# processed_files says processed
+# BUT
+# cdc_events contains zero rows.
+#
+# ============================================================
 
 FORCE_REPROCESS = (
     os.getenv(
@@ -501,14 +524,6 @@ def get_processed_etag(
 
 # ============================================================
 # COUNT EVENTS FOR FILE
-#
-# This is the important repair check.
-#
-# A file may exist in processed_files because an older version
-# of the worker marked it processed even though parsing produced
-# zero events.
-#
-# In that case the new worker MUST process it again.
 # ============================================================
 
 def count_events_for_file(
@@ -551,23 +566,6 @@ def count_events_for_file(
 
 # ============================================================
 # SHOULD PROCESS FILE
-#
-# Returns:
-#
-# True  -> process
-# False -> skip
-#
-# Rules:
-#
-# 1. FORCE_REPROCESS=true -> process
-#
-# 2. File never processed -> process
-#
-# 3. ETag changed -> process
-#
-# 4. Same ETag + zero CDC rows -> process
-#
-# 5. Same ETag + CDC rows exist -> skip
 # ============================================================
 
 def should_process_file(
@@ -590,6 +588,10 @@ def should_process_file(
         flush=True
     )
 
+    # --------------------------------------------------------
+    # FORCE
+    # --------------------------------------------------------
+
     if FORCE_REPROCESS:
 
         print(
@@ -599,12 +601,16 @@ def should_process_file(
 
         return True
 
+    # --------------------------------------------------------
+    # GET PREVIOUS
+    # --------------------------------------------------------
+
     info = get_processed_file_info(
         file_name
     )
 
     # --------------------------------------------------------
-    # Never processed
+    # NEVER PROCESSED
     # --------------------------------------------------------
 
     if info is None:
@@ -621,7 +627,7 @@ def should_process_file(
     )
 
     # --------------------------------------------------------
-    # Changed file
+    # ETAG CHANGED
     # --------------------------------------------------------
 
     if previous_etag != etag:
@@ -644,9 +650,9 @@ def should_process_file(
         return True
 
     # --------------------------------------------------------
-    # Same ETag.
+    # SAME ETAG
     #
-    # Now verify that the file actually produced events.
+    # Verify events actually exist.
     # --------------------------------------------------------
 
     event_count = count_events_for_file(
@@ -659,7 +665,7 @@ def should_process_file(
     )
 
     # --------------------------------------------------------
-    # IMPORTANT REPAIR CONDITION
+    # REPAIR
     # --------------------------------------------------------
 
     if event_count == 0:
@@ -671,31 +677,18 @@ def should_process_file(
         )
 
         print(
-            "PROCESS: Reprocessing file to repair "
-            "previous processing result.",
+            "PROCESS: Reprocessing file.",
             flush=True
         )
 
         return True
 
     # --------------------------------------------------------
-    # Normal skip
+    # NORMAL SKIP
     # --------------------------------------------------------
 
     print(
         f"SKIP: {file_name}",
-        flush=True
-    )
-
-    print(
-        f"  Already processed with ETag: "
-        f"{previous_etag}",
-        flush=True
-    )
-
-    print(
-        f"  CDC events already stored: "
-        f"{event_count}",
         flush=True
     )
 
@@ -768,6 +761,15 @@ def convert_timestamp_us(
 
 # ============================================================
 # CSV TIMESTAMP
+#
+# Supports:
+#
+# 13-08-2026 09:00
+# 13-08-2026 09:00:30
+# 2026-08-13 09:00:00
+# 2026-08-13T09:00:00
+# 2026-08-13T09:00:00Z
+# epoch milliseconds
 # ============================================================
 
 def parse_csv_timestamp(
@@ -787,7 +789,37 @@ def parse_csv_timestamp(
         return None
 
     # --------------------------------------------------------
-    # ISO timestamp
+    # DD-MM-YYYY HH:MM
+    # --------------------------------------------------------
+
+    try:
+
+        return datetime.strptime(
+            value,
+            "%d-%m-%Y %H:%M"
+        )
+
+    except ValueError:
+
+        pass
+
+    # --------------------------------------------------------
+    # DD-MM-YYYY HH:MM:SS
+    # --------------------------------------------------------
+
+    try:
+
+        return datetime.strptime(
+            value,
+            "%d-%m-%Y %H:%M:%S"
+        )
+
+    except ValueError:
+
+        pass
+
+    # --------------------------------------------------------
+    # ISO
     # --------------------------------------------------------
 
     try:
@@ -1029,12 +1061,6 @@ def find_record_id(
 
 # ============================================================
 # PARSE TOPIC
-#
-# postgres-connecter.public.employees
-#
-# connector = postgres-connecter
-# schema    = public
-# table     = employees
 # ============================================================
 
 def parse_topic(
@@ -1080,52 +1106,7 @@ def parse_topic(
 
 
 # ============================================================
-# EXTRACT DEBEZIUM PAYLOAD
-#
-# Supports all of these:
-#
-# A:
-# {
-#   "value": {
-#       "schema": {...},
-#       "payload": {...}
-#   }
-# }
-#
-# B:
-# {
-#   "value": {
-#       "before": ...,
-#       "after": ...,
-#       "op": "c"
-#   }
-# }
-#
-# C:
-# {
-#   "payload": {
-#       "before": ...,
-#       "after": ...,
-#       "op": "c"
-#   }
-# }
-#
-# D:
-# {
-#   "before": ...,
-#   "after": ...,
-#   "op": "c"
-# }
-#
-# E:
-# {
-#   "value": {
-#       "schema": ...,
-#       "payload": {
-#           ...
-#       }
-#   }
-# }
+# GET DEBEZIUM PAYLOAD
 # ============================================================
 
 def get_payload(
@@ -1140,7 +1121,7 @@ def get_payload(
         return None
 
     # --------------------------------------------------------
-    # FIRST: value
+    # VALUE
     # --------------------------------------------------------
 
     value = event.get(
@@ -1151,12 +1132,6 @@ def get_payload(
         value,
         dict
     ):
-
-        # ----------------------------------------------------
-        # Kafka Connect:
-        #
-        # value.payload
-        # ----------------------------------------------------
 
         payload = value.get(
             "payload"
@@ -1177,10 +1152,6 @@ def get_payload(
 
                 return payload
 
-        # ----------------------------------------------------
-        # Value itself is Debezium envelope
-        # ----------------------------------------------------
-
         if (
             "op" in value
             or
@@ -1192,7 +1163,7 @@ def get_payload(
             return value
 
     # --------------------------------------------------------
-    # SECOND: direct payload
+    # DIRECT PAYLOAD
     # --------------------------------------------------------
 
     payload = event.get(
@@ -1215,7 +1186,7 @@ def get_payload(
             return payload
 
     # --------------------------------------------------------
-    # THIRD: direct Debezium object
+    # DIRECT DEBEZIUM
     # --------------------------------------------------------
 
     if (
@@ -1232,7 +1203,7 @@ def get_payload(
 
 
 # ============================================================
-# EXTRACT EVENT METADATA
+# EVENT METADATA
 # ============================================================
 
 def get_event_metadata(
@@ -1251,10 +1222,6 @@ def get_event_metadata(
         "offset"
     )
 
-    # --------------------------------------------------------
-    # Partition
-    # --------------------------------------------------------
-
     try:
 
         if partition is not None:
@@ -1267,10 +1234,6 @@ def get_event_metadata(
 
         partition = None
 
-    # --------------------------------------------------------
-    # Kafka offset
-    # --------------------------------------------------------
-
     try:
 
         if kafka_offset is not None:
@@ -1282,10 +1245,6 @@ def get_event_metadata(
     except Exception:
 
         kafka_offset = None
-
-    # --------------------------------------------------------
-    # Timestamp
-    # --------------------------------------------------------
 
     timestamp_ms = event.get(
         "tsMs"
@@ -1362,7 +1321,7 @@ def parse_debezium_event(
         return None
 
     # --------------------------------------------------------
-    # EVENT METADATA
+    # METADATA
     # --------------------------------------------------------
 
     (
@@ -1445,7 +1404,7 @@ def parse_debezium_event(
                 )
 
     # --------------------------------------------------------
-    # TOPIC CAN ALSO SUPPLY SCHEMA/TABLE
+    # TOPIC SCHEMA/TABLE
     # --------------------------------------------------------
 
     topic_schema, topic_table = parse_topic(
@@ -1573,8 +1532,6 @@ def parse_debezium_event(
 
     # --------------------------------------------------------
     # EVENT ID
-    #
-    # Source line is unique within the source file.
     # --------------------------------------------------------
 
     event_id = line_number
@@ -1690,10 +1647,6 @@ def parse_jsonl(
 
     operation_counts = {}
 
-    # --------------------------------------------------------
-    # Process each physical line independently.
-    # --------------------------------------------------------
-
     for line_number, raw_line in enumerate(
         text.splitlines(),
         start=1
@@ -1706,10 +1659,6 @@ def parse_jsonl(
         if not line:
 
             continue
-
-        # ----------------------------------------------------
-        # JSON parse
-        # ----------------------------------------------------
 
         try:
 
@@ -1790,12 +1739,6 @@ def parse_jsonl(
                 "value"
             )
 
-            print(
-                f"  value type: "
-                f"{type(value).__name__}",
-                flush=True
-            )
-
             if isinstance(
                 value,
                 dict
@@ -1834,10 +1777,6 @@ def parse_jsonl(
                         flush=True
                     )
 
-        # ----------------------------------------------------
-        # Parse Debezium
-        # ----------------------------------------------------
-
         parsed_event = parse_debezium_event(
             event,
             file_name,
@@ -1848,14 +1787,7 @@ def parse_jsonl(
 
             ignored_lines += 1
 
-            # Print first few ignored records to diagnose
-            # unexpected Kafka Connect structures.
-
             if ignored_lines <= 5:
-
-                value = event.get(
-                    "value"
-                )
 
                 print(
                     "",
@@ -1873,38 +1805,6 @@ def parse_jsonl(
                     f"{list(event.keys())}",
                     flush=True
                 )
-
-                if isinstance(
-                    value,
-                    dict
-                ):
-
-                    print(
-                        f"  value keys: "
-                        f"{list(value.keys())}",
-                        flush=True
-                    )
-
-                    payload = value.get(
-                        "payload"
-                    )
-
-                    if isinstance(
-                        payload,
-                        dict
-                    ):
-
-                        print(
-                            f"  payload keys: "
-                            f"{list(payload.keys())}",
-                            flush=True
-                        )
-
-                        print(
-                            f"  payload op: "
-                            f"{payload.get('op')}",
-                            flush=True
-                        )
 
             continue
 
@@ -1925,10 +1825,6 @@ def parse_jsonl(
             )
             + 1
         )
-
-        # ----------------------------------------------------
-        # Debug first 3 events
-        # ----------------------------------------------------
 
         if len(events) <= 3:
 
@@ -2020,10 +1916,6 @@ def parse_jsonl(
                 flush=True
             )
 
-    # --------------------------------------------------------
-    # SUMMARY
-    # --------------------------------------------------------
-
     print(
         "",
         flush=True
@@ -2111,10 +2003,6 @@ def parse_cdc_json(
 
         return []
 
-    # --------------------------------------------------------
-    # Try normal JSON first.
-    # --------------------------------------------------------
-
     try:
 
         parsed = json.loads(
@@ -2138,20 +2026,12 @@ def parse_cdc_json(
             file_name
         )
 
-    # --------------------------------------------------------
-    # JSON array
-    # --------------------------------------------------------
-
     if isinstance(
         parsed,
         list
     ):
 
         json_events = parsed
-
-    # --------------------------------------------------------
-    # Single object
-    # --------------------------------------------------------
 
     elif isinstance(
         parsed,
@@ -2256,145 +2136,29 @@ def parse_cdc_json(
 
 
 # ============================================================
-# PARSE CSV
+# PARSE SIMPLE CDC CSV
+#
+# Format:
+#
+# event_id,event_type,event_timestamp,table_name,
+# record_id,before_data,after_data,ddl_statement
+#
+# Example:
+#
+# 1,INSERT,13-08-2026 09:00,customers,101,
+# ,{"name":"John","email":"john@example.com","city":"Chennai"},
+#
 # ============================================================
 
-def parse_cdc_csv(
-    data,
+def parse_simple_cdc_csv(
+    reader,
     file_name
 ):
 
     print(
-        f"Reading CSV: {file_name}",
+        "Detected CSV format: SIMPLE CDC",
         flush=True
     )
-
-    try:
-
-        text = data.decode(
-            "utf-8-sig"
-        )
-
-    except Exception as e:
-
-        print(
-            f"ERROR decoding CSV "
-            f"{file_name}: {e}",
-            flush=True
-        )
-
-        return []
-
-    if not text.strip():
-
-        print(
-            "CSV file is empty.",
-            flush=True
-        )
-
-        return []
-
-    csv_stream = StringIO(
-        text
-    )
-
-    reader = csv.DictReader(
-        csv_stream
-    )
-
-    if not reader.fieldnames:
-
-        print(
-            "ERROR: CSV has no header.",
-            flush=True
-        )
-
-        return []
-
-    # --------------------------------------------------------
-    # Normalize headers
-    # --------------------------------------------------------
-
-    reader.fieldnames = [
-
-        header.strip()
-        if header is not None
-        else None
-
-        for header in reader.fieldnames
-
-    ]
-
-    print(
-        f"CSV headers detected: "
-        f"{reader.fieldnames}",
-        flush=True
-    )
-
-    required_columns = [
-
-        "Timestamp (UTC)",
-        "Topic",
-        "Partition",
-        "Offset",
-        "Operation",
-        "Database",
-        "Table",
-        "Key",
-        "Before",
-        "After",
-    ]
-
-    missing_columns = [
-
-        column
-        for column in required_columns
-        if column not in reader.fieldnames
-
-    ]
-
-    if missing_columns:
-
-        print(
-            "",
-            flush=True
-        )
-
-        print(
-            "================================================",
-            flush=True
-        )
-
-        print(
-            f"ERROR: Invalid CSV format: "
-            f"{file_name}",
-            flush=True
-        )
-
-        print(
-            f"Missing columns: "
-            f"{missing_columns}",
-            flush=True
-        )
-
-        print(
-            f"Expected columns: "
-            f"{required_columns}",
-            flush=True
-        )
-
-        print(
-            f"Actual columns: "
-            f"{reader.fieldnames}",
-            flush=True
-        )
-
-        print(
-            "================================================",
-            flush=True
-        )
-
-        return []
 
     rows = []
 
@@ -2412,6 +2176,7 @@ def parse_cdc_csv(
 
         "READ": "READ",
         "R": "READ",
+
         "SNAPSHOT": "READ",
 
         "TRUNCATE": "TRUNCATE",
@@ -2434,9 +2199,363 @@ def parse_cdc_csv(
 
                 continue
 
+            if all(
+                value is None
+                or not str(value).strip()
+                for value in csv_row.values()
+            ):
+
+                continue
+
             # ------------------------------------------------
-            # Empty row
+            # EVENT ID
             # ------------------------------------------------
+
+            raw_event_id = (
+                csv_row.get(
+                    "event_id"
+                )
+                or ""
+            ).strip()
+
+            try:
+
+                event_id = int(
+                    raw_event_id
+                )
+
+            except Exception:
+
+                event_id = line_number
+
+            # ------------------------------------------------
+            # EVENT TYPE
+            # ------------------------------------------------
+
+            raw_event_type = (
+                csv_row.get(
+                    "event_type"
+                )
+                or ""
+            ).strip().upper()
+
+            event_type = operation_mapping.get(
+                raw_event_type,
+                "UNKNOWN"
+            )
+
+            if event_type == "UNKNOWN":
+
+                print(
+                    f"WARNING: Unknown event type "
+                    f"'{raw_event_type}' "
+                    f"on line {line_number}",
+                    flush=True
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # TIMESTAMP
+            # ------------------------------------------------
+
+            event_timestamp = parse_csv_timestamp(
+                csv_row.get(
+                    "event_timestamp"
+                )
+            )
+
+            # ------------------------------------------------
+            # TABLE
+            # ------------------------------------------------
+
+            table_name = (
+                csv_row.get(
+                    "table_name"
+                )
+                or ""
+            ).strip()
+
+            if not table_name:
+
+                table_name = "unknown"
+
+            # ------------------------------------------------
+            # RECORD ID
+            # ------------------------------------------------
+
+            record_id = (
+                csv_row.get(
+                    "record_id"
+                )
+                or ""
+            ).strip()
+
+            if not record_id:
+
+                record_id = None
+
+            # ------------------------------------------------
+            # BEFORE
+            # ------------------------------------------------
+
+            before_data = safe_json_value(
+                csv_row.get(
+                    "before_data"
+                )
+            )
+
+            # ------------------------------------------------
+            # AFTER
+            # ------------------------------------------------
+
+            after_data = safe_json_value(
+                csv_row.get(
+                    "after_data"
+                )
+            )
+
+            # ------------------------------------------------
+            # DDL
+            # ------------------------------------------------
+
+            ddl_statement = (
+                csv_row.get(
+                    "ddl_statement"
+                )
+                or ""
+            ).strip()
+
+            if not ddl_statement:
+
+                ddl_statement = None
+
+            # ------------------------------------------------
+            # ROW
+            # ------------------------------------------------
+
+            row = {
+
+                "event_id":
+                    event_id,
+
+                "event_type":
+                    event_type,
+
+                "event_timestamp":
+                    event_timestamp,
+
+                "topic":
+                    None,
+
+                "partition_number":
+                    None,
+
+                "kafka_offset":
+                    None,
+
+                "database_name":
+                    None,
+
+                "schema_name":
+                    None,
+
+                "table_name":
+                    table_name,
+
+                "record_id":
+                    record_id,
+
+                "before_data":
+                    before_data,
+
+                "after_data":
+                    after_data,
+
+                "ddl_statement":
+                    ddl_statement,
+
+                "snapshot":
+                    None,
+
+                "source_lsn":
+                    None,
+
+                "source_txid":
+                    None,
+
+                "source_line_number":
+                    line_number,
+
+                "source_file":
+                    file_name,
+            }
+
+            rows.append(
+                row
+            )
+
+            # ------------------------------------------------
+            # DEBUG FIRST 3
+            # ------------------------------------------------
+
+            if len(rows) <= 3:
+
+                print(
+                    "",
+                    flush=True
+                )
+
+                print(
+                    f"PARSED SIMPLE CDC EVENT "
+                    f"#{len(rows)}",
+                    flush=True
+                )
+
+                print(
+                    f"  Line      : {line_number}",
+                    flush=True
+                )
+
+                print(
+                    f"  Event ID  : {event_id}",
+                    flush=True
+                )
+
+                print(
+                    f"  Timestamp : {event_timestamp}",
+                    flush=True
+                )
+
+                print(
+                    f"  Operation : {event_type}",
+                    flush=True
+                )
+
+                print(
+                    f"  Table     : {table_name}",
+                    flush=True
+                )
+
+                print(
+                    f"  Record ID : {record_id}",
+                    flush=True
+                )
+
+                print(
+                    f"  Before    : {before_data}",
+                    flush=True
+                )
+
+                print(
+                    f"  After     : {after_data}",
+                    flush=True
+                )
+
+        except Exception as e:
+
+            print(
+                f"ERROR parsing simple CDC CSV "
+                f"{file_name}, line {line_number}: {e}",
+                flush=True
+            )
+
+            continue
+
+    print(
+        "",
+        flush=True
+    )
+
+    print(
+        "================================================",
+        flush=True
+    )
+
+    print(
+        f"Simple CDC CSV parsing complete: {file_name}",
+        flush=True
+    )
+
+    print(
+        f"CDC events parsed: {len(rows)}",
+        flush=True
+    )
+
+    print(
+        "================================================",
+        flush=True
+    )
+
+    return rows
+
+
+# ============================================================
+# PARSE KAFKA CDC CSV
+#
+# Format:
+#
+# Timestamp (UTC),
+# Topic,
+# Partition,
+# Offset,
+# Operation,
+# Database,
+# Table,
+# Key,
+# Before,
+# After
+#
+# ============================================================
+
+def parse_kafka_cdc_csv(
+    reader,
+    file_name
+):
+
+    print(
+        "Detected CSV format: KAFKA CDC",
+        flush=True
+    )
+
+    rows = []
+
+    operation_mapping = {
+
+        "INSERT": "INSERT",
+        "CREATE": "INSERT",
+        "C": "INSERT",
+
+        "UPDATE": "UPDATE",
+        "U": "UPDATE",
+
+        "DELETE": "DELETE",
+        "D": "DELETE",
+
+        "READ": "READ",
+        "R": "READ",
+
+        "SNAPSHOT": "READ",
+
+        "TRUNCATE": "TRUNCATE",
+        "T": "TRUNCATE",
+
+        "MESSAGE": "MESSAGE",
+        "M": "MESSAGE",
+
+        "DDL": "DDL",
+    }
+
+    for line_number, csv_row in enumerate(
+        reader,
+        start=2
+    ):
+
+        try:
+
+            if not csv_row:
+
+                continue
 
             if all(
                 value is None
@@ -2661,13 +2780,19 @@ def parse_cdc_csv(
                 )
 
             # ------------------------------------------------
+            # EVENT ID
+            # ------------------------------------------------
+
+            event_id = line_number
+
+            # ------------------------------------------------
             # ROW
             # ------------------------------------------------
 
             rows.append({
 
                 "event_id":
-                    line_number,
+                    event_id,
 
                 "event_type":
                     event_type,
@@ -2721,6 +2846,10 @@ def parse_cdc_csv(
                     file_name,
             })
 
+            # ------------------------------------------------
+            # DEBUG
+            # ------------------------------------------------
+
             if len(rows) <= 3:
 
                 print(
@@ -2729,78 +2858,67 @@ def parse_cdc_csv(
                 )
 
                 print(
-                    f"PARSED CSV EVENT "
+                    f"PARSED KAFKA CSV EVENT "
                     f"#{len(rows)}",
                     flush=True
                 )
 
                 print(
-                    f"  Line      : "
-                    f"{line_number}",
+                    f"  Line      : {line_number}",
                     flush=True
                 )
 
                 print(
-                    f"  Timestamp : "
-                    f"{event_timestamp}",
+                    f"  Timestamp : {event_timestamp}",
                     flush=True
                 )
 
                 print(
-                    f"  Topic     : "
-                    f"{topic}",
+                    f"  Topic     : {topic}",
                     flush=True
                 )
 
                 print(
-                    f"  Partition : "
-                    f"{partition}",
+                    f"  Partition : {partition}",
                     flush=True
                 )
 
                 print(
-                    f"  Offset    : "
-                    f"{kafka_offset}",
+                    f"  Offset    : {kafka_offset}",
                     flush=True
                 )
 
                 print(
-                    f"  Operation : "
-                    f"{event_type}",
+                    f"  Operation : {event_type}",
                     flush=True
                 )
 
                 print(
-                    f"  Database  : "
-                    f"{database_name}",
+                    f"  Database  : {database_name}",
                     flush=True
                 )
 
                 print(
-                    f"  Schema    : "
-                    f"{schema_name}",
+                    f"  Schema    : {schema_name}",
                     flush=True
                 )
 
                 print(
-                    f"  Table     : "
-                    f"{table_name}",
+                    f"  Table     : {table_name}",
                     flush=True
                 )
 
                 print(
-                    f"  Record ID : "
-                    f"{record_id}",
+                    f"  Record ID : {record_id}",
                     flush=True
                 )
 
         except Exception as e:
 
             print(
-                f"ERROR parsing CSV "
+                f"ERROR parsing Kafka CSV "
                 f"{file_name}, "
-                f"line {line_number}: "
-                f"{e}",
+                f"line {line_number}: {e}",
                 flush=True
             )
 
@@ -2839,19 +2957,17 @@ def parse_cdc_csv(
     )
 
     print(
-        f"CSV parsing complete: {file_name}",
+        f"Kafka CDC CSV parsing complete: {file_name}",
         flush=True
     )
 
     print(
-        f"Total CDC events parsed: "
-        f"{len(rows)}",
+        f"Total CDC events parsed: {len(rows)}",
         flush=True
     )
 
     print(
-        f"Operations: "
-        f"{operation_counts}",
+        f"Operations: {operation_counts}",
         flush=True
     )
 
@@ -2861,6 +2977,209 @@ def parse_cdc_csv(
     )
 
     return rows
+
+
+# ============================================================
+# PARSE CSV
+#
+# Automatically detects BOTH CSV formats.
+# ============================================================
+
+def parse_cdc_csv(
+    data,
+    file_name
+):
+
+    print(
+        f"Reading CSV: {file_name}",
+        flush=True
+    )
+
+    try:
+
+        text = data.decode(
+            "utf-8-sig"
+        )
+
+    except Exception as e:
+
+        print(
+            f"ERROR decoding CSV "
+            f"{file_name}: {e}",
+            flush=True
+        )
+
+        return []
+
+    if not text.strip():
+
+        print(
+            "CSV file is empty.",
+            flush=True
+        )
+
+        return []
+
+    csv_stream = StringIO(
+        text
+    )
+
+    reader = csv.DictReader(
+        csv_stream
+    )
+
+    if not reader.fieldnames:
+
+        print(
+            "ERROR: CSV has no header.",
+            flush=True
+        )
+
+        return []
+
+    # --------------------------------------------------------
+    # Normalize headers
+    # --------------------------------------------------------
+
+    reader.fieldnames = [
+
+        header.strip()
+        if header is not None
+        else None
+
+        for header in reader.fieldnames
+
+    ]
+
+    headers = set(
+        reader.fieldnames
+    )
+
+    print(
+        f"CSV headers detected: "
+        f"{reader.fieldnames}",
+        flush=True
+    )
+
+    # ========================================================
+    # FORMAT 1
+    # SIMPLE CDC
+    # ========================================================
+
+    simple_columns = {
+
+        "event_id",
+        "event_type",
+        "event_timestamp",
+        "table_name",
+        "record_id",
+        "before_data",
+        "after_data",
+        "ddl_statement",
+    }
+
+    if simple_columns.issubset(
+        headers
+    ):
+
+        return parse_simple_cdc_csv(
+            reader,
+            file_name
+        )
+
+    # ========================================================
+    # FORMAT 2
+    # KAFKA CDC
+    # ========================================================
+
+    kafka_columns = {
+
+        "Timestamp (UTC)",
+        "Topic",
+        "Partition",
+        "Offset",
+        "Operation",
+        "Database",
+        "Table",
+        "Key",
+        "Before",
+        "After",
+    }
+
+    if kafka_columns.issubset(
+        headers
+    ):
+
+        return parse_kafka_cdc_csv(
+            reader,
+            file_name
+        )
+
+    # ========================================================
+    # UNKNOWN FORMAT
+    # ========================================================
+
+    print(
+        "",
+        flush=True
+    )
+
+    print(
+        "================================================",
+        flush=True
+    )
+
+    print(
+        f"ERROR: Unsupported CSV format: "
+        f"{file_name}",
+        flush=True
+    )
+
+    print(
+        f"Detected columns: "
+        f"{reader.fieldnames}",
+        flush=True
+    )
+
+    print(
+        "",
+        flush=True
+    )
+
+    print(
+        "Supported CSV format #1:",
+        flush=True
+    )
+
+    print(
+        "event_id,event_type,event_timestamp,"
+        "table_name,record_id,before_data,"
+        "after_data,ddl_statement",
+        flush=True
+    )
+
+    print(
+        "",
+        flush=True
+    )
+
+    print(
+        "Supported CSV format #2:",
+        flush=True
+    )
+
+    print(
+        "Timestamp (UTC),Topic,Partition,Offset,"
+        "Operation,Database,Table,Key,Before,After",
+        flush=True
+    )
+
+    print(
+        "================================================",
+        flush=True
+    )
+
+    return []
 
 
 # ============================================================
@@ -3129,6 +3448,9 @@ def insert_events(
 
     # --------------------------------------------------------
     # Mark file processed
+    #
+    # IMPORTANT:
+    # This happens in the same DB transaction as inserts.
     # --------------------------------------------------------
 
     cursor.execute(
@@ -3229,7 +3551,7 @@ def process_file(
     ):
 
         print(
-            "Detected format: CSV",
+            "Detected extension: CSV",
             flush=True
         )
 
@@ -3243,7 +3565,7 @@ def process_file(
     ):
 
         print(
-            "Detected format: JSONL / NDJSON",
+            "Detected extension: JSONL / NDJSON",
             flush=True
         )
 
@@ -3257,7 +3579,7 @@ def process_file(
     ):
 
         print(
-            "Detected format: NDJSON",
+            "Detected extension: NDJSON",
             flush=True
         )
 
@@ -3271,7 +3593,7 @@ def process_file(
     ):
 
         print(
-            "Detected format: JSON / JSONL / NDJSON",
+            "Detected extension: JSON / JSONL / NDJSON",
             flush=True
         )
 
@@ -3295,7 +3617,7 @@ def process_file(
     )
 
     # --------------------------------------------------------
-    # NEVER MARK AN EMPTY PARSE AS PROCESSED
+    # NEVER MARK EMPTY PARSE AS PROCESSED
     # --------------------------------------------------------
 
     if not rows:
@@ -3334,13 +3656,6 @@ def process_file(
             file_name
         )
 
-        # ----------------------------------------------------
-        # Determine whether existing data needs replacement.
-        #
-        # If the file is being repaired because processed_files
-        # existed but CDC rows were zero, this DELETE is harmless.
-        # ----------------------------------------------------
-
         existing_event_count = count_events_for_file(
             file_name
         )
@@ -3351,9 +3666,7 @@ def process_file(
             previous_etag != etag
         )
 
-        force_rebuild = (
-            FORCE_REPROCESS
-        )
+        force_rebuild = FORCE_REPROCESS
 
         repair_empty_file = (
             previous_etag is not None
@@ -3362,6 +3675,10 @@ def process_file(
             and
             existing_event_count == 0
         )
+
+        # ----------------------------------------------------
+        # REBUILD WHEN NEEDED
+        # ----------------------------------------------------
 
         if (
             file_changed
@@ -3396,8 +3713,8 @@ def process_file(
             elif repair_empty_file:
 
                 print(
-                    "Reason: File was previously marked "
-                    "processed but contains zero CDC rows.",
+                    "Reason: Previously processed but "
+                    "zero CDC rows existed.",
                     flush=True
                 )
 
@@ -3426,15 +3743,34 @@ def process_file(
             etag
         )
 
-        conn.commit()
-
         # ----------------------------------------------------
-        # Verify database result
+        # Verify before commit
+        #
+        # We need the same transaction to contain:
+        #
+        # CDC rows
+        # processed_files row
+        #
         # ----------------------------------------------------
 
-        final_count = count_events_for_file(
-            file_name
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM cdc_events
+            WHERE source_file = %s
+            """,
+            (
+                file_name,
+            )
         )
+
+        final_count = int(
+            cursor.fetchone()[0]
+        )
+
+        cursor.close()
 
         if final_count == 0:
 
@@ -3442,6 +3778,12 @@ def process_file(
                 "Insert completed but database still "
                 "contains ZERO CDC events for this file."
             )
+
+        conn.commit()
+
+        # ----------------------------------------------------
+        # SUCCESS
+        # ----------------------------------------------------
 
         print(
             "",
@@ -3541,6 +3883,16 @@ def scan_minio():
     )
 
     print(
+        f"MinIO bucket: {MINIO_BUCKET}",
+        flush=True
+    )
+
+    print(
+        f"MinIO prefix: {MINIO_PREFIX}",
+        flush=True
+    )
+
+    print(
         f"Force reprocess this scan: "
         f"{FORCE_REPROCESS}",
         flush=True
@@ -3600,7 +3952,7 @@ def scan_minio():
             lower_name = file_name.lower()
 
             # ------------------------------------------------
-            # Supported formats
+            # Supported files
             # ------------------------------------------------
 
             if not (
@@ -3626,7 +3978,7 @@ def scan_minio():
             supported_files += 1
 
             # ------------------------------------------------
-            # ETag
+            # ETAG
             # ------------------------------------------------
 
             etag = (
@@ -3641,7 +3993,7 @@ def scan_minio():
             )
 
             # ------------------------------------------------
-            # DECIDE WHETHER TO PROCESS
+            # DECIDE
             # ------------------------------------------------
 
             try:
@@ -3843,6 +4195,12 @@ def main():
     print(
         "Supported files: "
         "CSV / JSON / JSONL / NDJSON",
+        flush=True
+    )
+
+    print(
+        "Supported CSV: "
+        "Simple CDC + Kafka CDC",
         flush=True
     )
 
