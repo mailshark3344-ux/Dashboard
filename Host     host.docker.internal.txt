@@ -74,4 +74,4 @@ MinIO Console	http://localhost:9101
 MinIO API	http://localhost:9100
 Python worker	Runs automatically in Docker
 PostgreSQL	localhost:5433
-
+7000	cdc-file-picker	Your custom file-picker Python application
