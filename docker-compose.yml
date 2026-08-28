@@ -80,3 +80,5 @@ services:
       POSTGRES_PASSWORD: redashpass
       POLL_INTERVAL: 10
     restart: unless-stopped   
+
+   
