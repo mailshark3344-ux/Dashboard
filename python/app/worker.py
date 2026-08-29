@@ -43,19 +43,19 @@ MINIO_BUCKET = os.getenv(
 #
 # Therefore your Docker environment should use:
 #
-# MINIO_PREFIX="cdc data/"
+# MINIO_PREFIX="cdc data/cdc/"
 #
-# If you later upload objects under normal:
+# If you later upload objects under:
 #
-# cdc/cdc_001.csv
+# cdc data/cdc_001.csv
 #
 # change this to:
 #
-# MINIO_PREFIX="cdc/"
+# MINIO_PREFIX="cdc data/"
 #
 MINIO_PREFIX = os.getenv(
     "MINIO_PREFIX",
-    "cdc data/"
+    "cdc data/cdc/"
 )
 
 POLL_INTERVAL = int(

@@ -1,84 +1,219 @@
 services:
+
+  # ============================================================
+  # POSTGRES
+  # ============================================================
+
   postgres:
     image: postgres:16
     container_name: cdc-postgres
+
     environment:
       POSTGRES_DB: redash
       POSTGRES_USER: redash
       POSTGRES_PASSWORD: redashpass
+
     volumes:
       - ./postgres:/var/lib/postgresql/data
+
     ports:
       - "5433:5432"
+
     restart: unless-stopped
+
+
+  # ============================================================
+  # REDIS
+  # ============================================================
 
   redis:
     image: redis:7-alpine
     container_name: cdc-redis
+
     restart: unless-stopped
 
-  # ✅ One-time DB migration (runs before server starts)
+
+  # ============================================================
+  # REDASH DATABASE INITIALIZATION
+  # ============================================================
+
   redash-create-db:
     image: redash/redash:26.3.0
     container_name: cdc-redash-createdb
+
     command: create_db
+
     depends_on:
       - postgres
       - redis
+
     environment:
       REDASH_DATABASE_URL: postgresql://redash:redashpass@postgres:5432/redash
       REDASH_REDIS_URL: redis://redis:6379/0
+
       REDASH_COOKIE_SECRET: cdc-dashboard-secret
       REDASH_SECRET_KEY: cdc-dashboard-secret
+
     restart: "no"
+
+
+  # ============================================================
+  # REDASH WEB SERVER
+  # ============================================================
 
   redash:
     image: redash/redash:26.3.0
     container_name: cdc-redash
+
     depends_on:
       redash-create-db:
         condition: service_completed_successfully
+
     environment:
       REDASH_DATABASE_URL: postgresql://redash:redashpass@postgres:5432/redash
       REDASH_REDIS_URL: redis://redis:6379/0
+
       REDASH_COOKIE_SECRET: cdc-dashboard-secret
       REDASH_SECRET_KEY: cdc-dashboard-secret
+
       REDASH_GUNICORN_TIMEOUT: "120"
+
     ports:
       - "5000:5000"
+
     restart: unless-stopped
+
+
+  # ============================================================
+  # REDASH WORKER
+  #
+  # Executes queued queries.
+  # ============================================================
 
   redash-worker:
     image: redash/redash:26.3.0
     container_name: cdc-redash-worker
+
     depends_on:
       - redash
+
     environment:
       REDASH_DATABASE_URL: postgresql://redash:redashpass@postgres:5432/redash
       REDASH_REDIS_URL: redis://redis:6379/0
+
       REDASH_COOKIE_SECRET: cdc-dashboard-secret
       REDASH_SECRET_KEY: cdc-dashboard-secret
+
     command: worker
+
     restart: unless-stopped
+
+
+  # ============================================================
+  # REDASH SCHEDULER
+  #
+  # IMPORTANT:
+  #
+  # This process checks Redash scheduled queries and puts
+  # them into Redis for the workers to execute.
+  # ============================================================
+
+  redash-scheduler:
+    image: redash/redash:26.3.0
+    container_name: cdc-redash-scheduler
+
+    depends_on:
+      - redash
+      - redis
+      - postgres
+
+    environment:
+      REDASH_DATABASE_URL: postgresql://redash:redashpass@postgres:5432/redash
+      REDASH_REDIS_URL: redis://redis:6379/0
+
+      REDASH_COOKIE_SECRET: cdc-dashboard-secret
+      REDASH_SECRET_KEY: cdc-dashboard-secret
+
+    command: scheduler
+
+    restart: unless-stopped
+
+
+  # ============================================================
+  # PYTHON CDC WORKER
+  # ============================================================
 
   python-worker:
     build:
       context: ./python
+
     container_name: cdc-python-worker
+
     depends_on:
       - postgres
+
     environment:
+
+      # -------------------------
+      # MINIO
+      # -------------------------
+
       MINIO_ENDPOINT: http://cdc-minio:9000
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin123
       MINIO_BUCKET: myfiles
-      MINIO_PREFIX: cdc data/cdc/
+      MINIO_PREFIX: ""
+
+      # -------------------------
+      # POSTGRES
+      # -------------------------
+
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_DB: redash
       POSTGRES_USER: redash
       POSTGRES_PASSWORD: redashpass
-      POLL_INTERVAL: 10
-    restart: unless-stopped   
 
-   
+      # -------------------------
+      # CDC POLLING
+      # -------------------------
+
+      POLL_INTERVAL: 10
+
+    restart: unless-stopped
+
+
+  # ============================================================
+  # MINIO FILE PICKER
+  # ============================================================
+
+  file-picker:
+    build:
+      context: ./file-picker
+
+    container_name: cdc-file-picker
+
+    environment:
+
+      # -------------------------
+      # MINIO
+      # -------------------------
+
+      MINIO_ENDPOINT: http://cdc-minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin123
+      MINIO_BUCKET: myfiles
+
+      # -------------------------
+      # REDASH
+      #
+      # Browser redirects to this URL
+      # after selecting a file.
+      # -------------------------
+
+      REDASH_URL: http://127.0.0.1:5000/dashboards/1-dashboard
+
+    ports:
+      - "7000:7000"
+
+    restart: unless-stopped

@@ -49,3 +49,5 @@ minio-data/
 
 # Redash/local generated files
 .redash/
+
+postgres/

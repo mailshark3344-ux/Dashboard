@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+
+    <title>Select CDC File</title>
+
+    <style>
+
+        body {
+            font-family: Arial, sans-serif;
+            margin: 40px;
+            background: #f5f7fa;
+        }
+
+        h2 {
+            color: #333;
+        }
+
+        .location {
+            background: white;
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            border: 1px solid #ddd;
+        }
+
+        .item {
+            background: white;
+            padding: 14px;
+            margin: 8px 0;
+            border-radius: 6px;
+            border: 1px solid #ddd;
+        }
+
+        a {
+            text-decoration: none;
+            color: #1976d2;
+            font-weight: bold;
+        }
+
+        button {
+            background: #1976d2;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+
+        button:hover {
+            background: #125aa0;
+        }
+
+        .folder {
+            color: #1976d2;
+        }
+
+        .file {
+            color: #333;
+        }
+
+        .back {
+            background: #eeeeee;
+        }
+
+    </style>
+
+</head>
+
+<body>
+
+    <h2>📁 Select CDC File</h2>
+
+    <div class="location">
+
+        Current location:
+
+        <strong>
+            {{ prefix if prefix else "/" }}
+        </strong>
+
+    </div>
+
+
+    <!-- BACK -->
+
+    {% if parent_prefix is not none %}
+
+        <div class="item back">
+
+            <a href="/select?prefix={{ parent_prefix|urlencode }}">
+                ⬅️ Back
+            </a>
+
+        </div>
+
+    {% endif %}
+
+
+    <!-- FOLDERS -->
+
+    {% for folder in folders %}
+
+        <div class="item folder">
+
+            📁
+
+            <a href="/select?prefix={{ folder.prefix|urlencode }}">
+                {{ folder.name }}
+            </a>
+
+        </div>
+
+    {% endfor %}
+
+
+    <!-- FILES -->
+
+    {% for file in files %}
+
+        <div class="item file">
+
+            📄 {{ file.name }}
+
+            <a
+                href="/choose?file={{ file.key|urlencode }}"
+                style="float:right;"
+            >
+
+                <button>
+                    Select
+                </button>
+
+            </a>
+
+        </div>
+
+    {% endfor %}
+
+
+    <!-- NOTHING FOUND -->
+
+    {% if not folders and not files %}
+
+        <div class="item">
+
+            No files or folders found.
+
+        </div>
+
+    {% endif %}
+
+</body>
+
+</html>
