@@ -86,8 +86,6 @@ services:
 
   # ============================================================
   # REDASH WORKER
-  #
-  # Executes queued queries.
   # ============================================================
 
   redash-worker:
@@ -111,11 +109,6 @@ services:
 
   # ============================================================
   # REDASH SCHEDULER
-  #
-  # IMPORTANT:
-  #
-  # This process checks Redash scheduled queries and puts
-  # them into Redis for the workers to execute.
   # ============================================================
 
   redash-scheduler:
@@ -141,6 +134,9 @@ services:
 
   # ============================================================
   # PYTHON CDC WORKER
+  #
+  # Uses the EXISTING cdc-minio container.
+  # cdc-minio is already attached to cdc-dashboard_default.
   # ============================================================
 
   python-worker:
@@ -178,13 +174,21 @@ services:
       # CDC POLLING
       # -------------------------
 
-      POLL_INTERVAL: 10
+      POLL_INTERVAL: "10"
+
+      # -------------------------
+      # PROCESSING
+      # -------------------------
+
+      FORCE_REPROCESS: "false"
 
     restart: unless-stopped
 
 
   # ============================================================
   # MINIO FILE PICKER
+  #
+  # Uses the EXISTING cdc-minio container.
   # ============================================================
 
   file-picker:
@@ -192,6 +196,9 @@ services:
       context: ./file-picker
 
     container_name: cdc-file-picker
+
+    depends_on:
+      - postgres
 
     environment:
 
@@ -206,9 +213,6 @@ services:
 
       # -------------------------
       # REDASH
-      #
-      # Browser redirects to this URL
-      # after selecting a file.
       # -------------------------
 
       REDASH_URL: http://127.0.0.1:5000/dashboards/1-dashboard

@@ -29,33 +29,77 @@ MINIO_SECRET_KEY = os.getenv(
     "minioadmin123"
 )
 
-MINIO_BUCKET = os.getenv(
-    "MINIO_BUCKET",
-    "myfiles"
-)
+# ------------------------------------------------------------
+# BUCKET CONFIGURATION
+# ------------------------------------------------------------
+#
+# Preferred:
+#
+# MINIO_BUCKETS=customer-a,customer-b,cdc-production
+#
+# The worker will scan only these buckets.
+#
+# If MINIO_BUCKETS is empty, the worker will discover all
+# buckets accessible by the configured MinIO credentials.
+#
+# For security, it is recommended to explicitly configure
+# MINIO_BUCKETS rather than allowing automatic discovery.
+#
+# ------------------------------------------------------------
 
-# IMPORTANT:
+MINIO_BUCKETS_RAW = os.getenv(
+    "MINIO_BUCKETS",
+    ""
+).strip()
+
+# ------------------------------------------------------------
+# Backward compatibility
+# ------------------------------------------------------------
 #
-# Your actual objects currently look like:
+# Older configuration used:
 #
-# cdc data/cdc/cdc_001.csv
-# cdc data/cdc/cdc_003.csv
+# MINIO_BUCKET=myfiles
 #
-# Therefore your Docker environment should use:
+# If MINIO_BUCKETS is not supplied, this value is also accepted.
 #
-# MINIO_PREFIX="cdc data/cdc/"
+# ------------------------------------------------------------
+
+LEGACY_MINIO_BUCKET = os.getenv(
+    "MINIO_BUCKET",
+    ""
+).strip()
+
+# ------------------------------------------------------------
+# Legacy bucket used for database migration
+# ------------------------------------------------------------
 #
-# If you later upload objects under:
+# Existing processed_files / cdc_events rows from the old
+# single-bucket implementation need a bucket name.
 #
-# cdc data/cdc_001.csv
+# If you previously used "myfiles", this remains the default.
 #
-# change this to:
+# ------------------------------------------------------------
+
+LEGACY_DEFAULT_BUCKET = os.getenv(
+    "LEGACY_DEFAULT_BUCKET",
+    LEGACY_MINIO_BUCKET or "myfiles"
+).strip()
+
+# ------------------------------------------------------------
+# PREFIX
+# ------------------------------------------------------------
 #
-# MINIO_PREFIX="cdc data/"
+# Example:
 #
+# MINIO_PREFIX=cdc data/cdc/
+#
+# Empty means scan the entire bucket.
+#
+# ------------------------------------------------------------
+
 MINIO_PREFIX = os.getenv(
     "MINIO_PREFIX",
-    "cdc data/cdc/"
+    ""
 )
 
 POLL_INTERVAL = int(
@@ -64,6 +108,10 @@ POLL_INTERVAL = int(
         "10"
     )
 )
+
+# ------------------------------------------------------------
+# DATABASE
+# ------------------------------------------------------------
 
 POSTGRES_HOST = os.getenv(
     "POSTGRES_HOST",
@@ -96,23 +144,6 @@ POSTGRES_PASSWORD = os.getenv(
 # ============================================================
 # FORCE REPROCESS
 # ============================================================
-#
-# Set:
-#
-# FORCE_REPROCESS=true
-#
-# if you want every supported MinIO file to be rebuilt
-# on every scan.
-#
-# Normally leave this false.
-#
-# The worker automatically repairs files where:
-#
-# processed_files says processed
-# BUT
-# cdc_events contains zero rows.
-#
-# ============================================================
 
 FORCE_REPROCESS = (
     os.getenv(
@@ -127,6 +158,44 @@ FORCE_REPROCESS = (
         "on"
     )
 )
+
+
+# ============================================================
+# DISCOVER BUCKETS
+# ============================================================
+
+def get_configured_buckets():
+    """
+    Return explicitly configured buckets.
+
+    Priority:
+
+    1. MINIO_BUCKETS
+    2. MINIO_BUCKET
+    3. Empty list
+
+    Empty list means automatic bucket discovery is enabled.
+    """
+
+    buckets = []
+
+    if MINIO_BUCKETS_RAW:
+
+        for bucket in MINIO_BUCKETS_RAW.split(","):
+
+            bucket = bucket.strip()
+
+            if bucket and bucket not in buckets:
+
+                buckets.append(bucket)
+
+    elif LEGACY_MINIO_BUCKET:
+
+        buckets.append(
+            LEGACY_MINIO_BUCKET
+        )
+
+    return buckets
 
 
 # ============================================================
@@ -169,23 +238,131 @@ def initialize_database():
 
         cursor = conn.cursor()
 
-        # ----------------------------------------------------
+        # ====================================================
         # PROCESSED FILES
-        # ----------------------------------------------------
+        # ====================================================
 
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS processed_files (
-                file_name TEXT PRIMARY KEY,
+                file_name TEXT NOT NULL,
                 file_etag TEXT,
                 processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
 
-        # ----------------------------------------------------
+        # ====================================================
+        # ADD BUCKET COLUMN
+        # ====================================================
+
+        cursor.execute(
+            """
+            ALTER TABLE processed_files
+            ADD COLUMN IF NOT EXISTS bucket_name TEXT;
+            """
+        )
+
+        # ====================================================
+        # MIGRATE EXISTING processed_files
+        #
+        # Old version had:
+        #
+        # file_name PRIMARY KEY
+        #
+        # Assign old records to LEGACY_DEFAULT_BUCKET.
+        # ====================================================
+
+        if LEGACY_DEFAULT_BUCKET:
+
+            cursor.execute(
+                """
+                UPDATE processed_files
+                SET bucket_name = %s
+                WHERE bucket_name IS NULL
+                """,
+                (
+                    LEGACY_DEFAULT_BUCKET,
+                )
+            )
+
+        # ====================================================
+        # REMOVE NULLS
+        # ====================================================
+
+        cursor.execute(
+            """
+            UPDATE processed_files
+            SET bucket_name = 'unknown'
+            WHERE bucket_name IS NULL
+            """
+        )
+
+        # ====================================================
+        # MAKE bucket_name NOT NULL
+        # ====================================================
+
+        cursor.execute(
+            """
+            ALTER TABLE processed_files
+            ALTER COLUMN bucket_name SET NOT NULL;
+            """
+        )
+
+        # ====================================================
+        # DROP OLD PRIMARY KEY
+        # ====================================================
+        #
+        # Older installation normally created:
+        #
+        # processed_files_pkey
+        #
+        # We remove it so bucket + file can become the key.
+        #
+        # ====================================================
+
+        cursor.execute(
+            """
+            ALTER TABLE processed_files
+            DROP CONSTRAINT IF EXISTS processed_files_pkey;
+            """
+        )
+
+        # ====================================================
+        # REMOVE POSSIBLE DUPLICATES
+        #
+        # This protects migration if duplicate rows somehow
+        # exist for the same bucket/file.
+        # ====================================================
+
+        cursor.execute(
+            """
+            DELETE FROM processed_files a
+            USING processed_files b
+            WHERE a.ctid < b.ctid
+              AND a.bucket_name = b.bucket_name
+              AND a.file_name = b.file_name;
+            """
+        )
+
+        # ====================================================
+        # NEW PRIMARY KEY
+        # ====================================================
+
+        cursor.execute(
+            """
+            ALTER TABLE processed_files
+            ADD CONSTRAINT processed_files_pkey
+            PRIMARY KEY (
+                bucket_name,
+                file_name
+            );
+            """
+        )
+
+        # ====================================================
         # CDC EVENTS
-        # ----------------------------------------------------
+        # ====================================================
 
         cursor.execute(
             """
@@ -216,6 +393,7 @@ def initialize_database():
                 source_lsn BIGINT,
                 source_txid BIGINT,
 
+                source_bucket TEXT,
                 source_file TEXT,
                 source_line_number INTEGER,
 
@@ -224,9 +402,9 @@ def initialize_database():
             """
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # MIGRATION COLUMNS
-        # ----------------------------------------------------
+        # ====================================================
 
         alter_statements = [
 
@@ -312,6 +490,11 @@ def initialize_database():
 
             """
             ALTER TABLE cdc_events
+            ADD COLUMN IF NOT EXISTS source_bucket TEXT;
+            """,
+
+            """
+            ALTER TABLE cdc_events
             ADD COLUMN IF NOT EXISTS source_file TEXT;
             """,
 
@@ -329,11 +512,30 @@ def initialize_database():
 
         for statement in alter_statements:
 
-            cursor.execute(statement)
+            cursor.execute(
+                statement
+            )
 
-        # ----------------------------------------------------
+        # ====================================================
+        # MIGRATE EXISTING CDC EVENTS
+        # ====================================================
+
+        if LEGACY_DEFAULT_BUCKET:
+
+            cursor.execute(
+                """
+                UPDATE cdc_events
+                SET source_bucket = %s
+                WHERE source_bucket IS NULL
+                """,
+                (
+                    LEGACY_DEFAULT_BUCKET,
+                )
+            )
+
+        # ====================================================
         # INDEXES
-        # ----------------------------------------------------
+        # ====================================================
 
         cursor.execute(
             """
@@ -378,6 +580,25 @@ def initialize_database():
         cursor.execute(
             """
             CREATE INDEX IF NOT EXISTS
+            idx_cdc_events_source_bucket
+            ON cdc_events(source_bucket);
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_cdc_events_source_bucket_file
+            ON cdc_events(
+                source_bucket,
+                source_file
+            );
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
             idx_cdc_events_topic_partition_offset
             ON cdc_events(
                 topic,
@@ -387,9 +608,9 @@ def initialize_database():
             """
         )
 
-        # ----------------------------------------------------
-        # REMOVE OLD UNIQUE INDEX
-        # ----------------------------------------------------
+        # ====================================================
+        # REMOVE OLD UNIQUE INDEXES
+        # ====================================================
 
         cursor.execute(
             """
@@ -398,15 +619,30 @@ def initialize_database():
             """
         )
 
-        # ----------------------------------------------------
+        cursor.execute(
+            """
+            DROP INDEX IF EXISTS
+            uq_cdc_event_file_topic_partition_offset;
+            """
+        )
+
+        cursor.execute(
+            """
+            DROP INDEX IF EXISTS
+            uq_cdc_event_file_event_id_fallback;
+            """
+        )
+
+        # ====================================================
         # KAFKA EVENT UNIQUE INDEX
-        # ----------------------------------------------------
+        # ====================================================
 
         cursor.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS
-            uq_cdc_event_file_topic_partition_offset
+            uq_cdc_event_bucket_file_topic_partition_offset
             ON cdc_events(
+                source_bucket,
                 source_file,
                 topic,
                 partition_number,
@@ -419,22 +655,26 @@ def initialize_database():
             """
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # NON-KAFKA FALLBACK UNIQUE INDEX
-        # ----------------------------------------------------
+        # ====================================================
 
         cursor.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS
-            uq_cdc_event_file_event_id_fallback
+            uq_cdc_event_bucket_file_event_id_fallback
             ON cdc_events(
+                source_bucket,
                 source_file,
                 event_id
             )
             WHERE
-                topic IS NULL
-                OR partition_number IS NULL
-                OR kafka_offset IS NULL;
+                (
+                    topic IS NULL
+                    OR partition_number IS NULL
+                    OR kafka_offset IS NULL
+                )
+                AND event_id IS NOT NULL;
             """
         )
 
@@ -463,6 +703,7 @@ def initialize_database():
 # ============================================================
 
 def get_processed_file_info(
+    bucket_name,
     file_name
 ):
 
@@ -478,9 +719,11 @@ def get_processed_file_info(
                 file_etag,
                 processed_at
             FROM processed_files
-            WHERE file_name = %s
+            WHERE bucket_name = %s
+              AND file_name = %s
             """,
             (
+                bucket_name,
                 file_name,
             )
         )
@@ -508,10 +751,12 @@ def get_processed_file_info(
 # ============================================================
 
 def get_processed_etag(
+    bucket_name,
     file_name
 ):
 
     info = get_processed_file_info(
+        bucket_name,
         file_name
     )
 
@@ -527,6 +772,7 @@ def get_processed_etag(
 # ============================================================
 
 def count_events_for_file(
+    bucket_name,
     file_name
 ):
 
@@ -540,9 +786,11 @@ def count_events_for_file(
             """
             SELECT COUNT(*)
             FROM cdc_events
-            WHERE source_file = %s
+            WHERE source_bucket = %s
+              AND source_file = %s
             """,
             (
+                bucket_name,
                 file_name,
             )
         )
@@ -569,6 +817,7 @@ def count_events_for_file(
 # ============================================================
 
 def should_process_file(
+    bucket_name,
     file_name,
     etag
 ):
@@ -579,7 +828,7 @@ def should_process_file(
     )
 
     print(
-        f"Checking: {file_name}",
+        f"Checking: {bucket_name}/{file_name}",
         flush=True
     )
 
@@ -606,6 +855,7 @@ def should_process_file(
     # --------------------------------------------------------
 
     info = get_processed_file_info(
+        bucket_name,
         file_name
     )
 
@@ -651,11 +901,10 @@ def should_process_file(
 
     # --------------------------------------------------------
     # SAME ETAG
-    #
-    # Verify events actually exist.
     # --------------------------------------------------------
 
     event_count = count_events_for_file(
+        bucket_name,
         file_name
     )
 
@@ -688,7 +937,7 @@ def should_process_file(
     # --------------------------------------------------------
 
     print(
-        f"SKIP: {file_name}",
+        f"SKIP: {bucket_name}/{file_name}",
         flush=True
     )
 
@@ -761,15 +1010,6 @@ def convert_timestamp_us(
 
 # ============================================================
 # CSV TIMESTAMP
-#
-# Supports:
-#
-# 13-08-2026 09:00
-# 13-08-2026 09:00:30
-# 2026-08-13 09:00:00
-# 2026-08-13T09:00:00
-# 2026-08-13T09:00:00Z
-# epoch milliseconds
 # ============================================================
 
 def parse_csv_timestamp(
@@ -1032,10 +1272,6 @@ def find_record_id(
                     value
                 )
 
-    # --------------------------------------------------------
-    # Fallback first value
-    # --------------------------------------------------------
-
     try:
 
         first_key = next(
@@ -1120,10 +1356,6 @@ def get_payload(
 
         return None
 
-    # --------------------------------------------------------
-    # VALUE
-    # --------------------------------------------------------
-
     value = event.get(
         "value"
     )
@@ -1162,10 +1394,6 @@ def get_payload(
 
             return value
 
-    # --------------------------------------------------------
-    # DIRECT PAYLOAD
-    # --------------------------------------------------------
-
     payload = event.get(
         "payload"
     )
@@ -1184,10 +1412,6 @@ def get_payload(
         ):
 
             return payload
-
-    # --------------------------------------------------------
-    # DIRECT DEBEZIUM
-    # --------------------------------------------------------
 
     if (
         "op" in event
@@ -1292,10 +1516,6 @@ def parse_debezium_event(
 
         return None
 
-    # --------------------------------------------------------
-    # BEFORE / AFTER
-    # --------------------------------------------------------
-
     before_data = payload.get(
         "before"
     )
@@ -1303,10 +1523,6 @@ def parse_debezium_event(
     after_data = payload.get(
         "after"
     )
-
-    # --------------------------------------------------------
-    # OPERATION
-    # --------------------------------------------------------
 
     op = payload.get(
         "op"
@@ -1320,10 +1536,6 @@ def parse_debezium_event(
 
         return None
 
-    # --------------------------------------------------------
-    # METADATA
-    # --------------------------------------------------------
-
     (
         topic,
         partition,
@@ -1332,10 +1544,6 @@ def parse_debezium_event(
     ) = get_event_metadata(
         event
     )
-
-    # --------------------------------------------------------
-    # SOURCE
-    # --------------------------------------------------------
 
     source = payload.get(
         "source"
@@ -1348,25 +1556,13 @@ def parse_debezium_event(
 
         source = {}
 
-    # --------------------------------------------------------
-    # DATABASE
-    # --------------------------------------------------------
-
     database_name = source.get(
         "db"
     )
 
-    # --------------------------------------------------------
-    # SCHEMA
-    # --------------------------------------------------------
-
     schema_name = source.get(
         "schema"
     )
-
-    # --------------------------------------------------------
-    # TABLE
-    # --------------------------------------------------------
 
     table_name = source.get(
         "table"
@@ -1375,10 +1571,6 @@ def parse_debezium_event(
     if not table_name:
 
         table_name = "unknown"
-
-    # --------------------------------------------------------
-    # TOPIC FALLBACK
-    # --------------------------------------------------------
 
     if not topic:
 
@@ -1403,10 +1595,6 @@ def parse_debezium_event(
                     f"{table_name}"
                 )
 
-    # --------------------------------------------------------
-    # TOPIC SCHEMA/TABLE
-    # --------------------------------------------------------
-
     topic_schema, topic_table = parse_topic(
         topic,
         database_name,
@@ -1425,10 +1613,6 @@ def parse_debezium_event(
         if topic_table:
 
             table_name = topic_table
-
-    # --------------------------------------------------------
-    # EVENT TIMESTAMP
-    # --------------------------------------------------------
 
     timestamp_ms = payload.get(
         "ts_ms"
@@ -1454,10 +1638,6 @@ def parse_debezium_event(
         timestamp_ms
     )
 
-    # --------------------------------------------------------
-    # SNAPSHOT
-    # --------------------------------------------------------
-
     snapshot_value = source.get(
         "snapshot"
     )
@@ -1480,10 +1660,6 @@ def parse_debezium_event(
             )
         )
 
-    # --------------------------------------------------------
-    # SOURCE LSN
-    # --------------------------------------------------------
-
     source_lsn = source.get(
         "lsn"
     )
@@ -1499,10 +1675,6 @@ def parse_debezium_event(
     except Exception:
 
         source_lsn = None
-
-    # --------------------------------------------------------
-    # SOURCE TXID
-    # --------------------------------------------------------
 
     source_txid = source.get(
         "txId"
@@ -1520,19 +1692,11 @@ def parse_debezium_event(
 
         source_txid = None
 
-    # --------------------------------------------------------
-    # RECORD ID
-    # --------------------------------------------------------
-
     record_id = find_record_id(
         after_data,
         before_data,
         table_name
     )
-
-    # --------------------------------------------------------
-    # EVENT ID
-    # --------------------------------------------------------
 
     event_id = line_number
 
@@ -1640,11 +1804,8 @@ def parse_jsonl(
     events = []
 
     total_lines = 0
-
     invalid_lines = 0
-
     ignored_lines = 0
-
     operation_counts = {}
 
     for line_number, raw_line in enumerate(
@@ -1689,10 +1850,6 @@ def parse_jsonl(
 
             continue
 
-        # ----------------------------------------------------
-        # FIRST RECORD DEBUG
-        # ----------------------------------------------------
-
         if total_lines == 1:
 
             print(
@@ -1734,48 +1891,6 @@ def parse_jsonl(
                 f"{event.get('tsMs')}",
                 flush=True
             )
-
-            value = event.get(
-                "value"
-            )
-
-            if isinstance(
-                value,
-                dict
-            ):
-
-                print(
-                    f"  value keys: "
-                    f"{list(value.keys())}",
-                    flush=True
-                )
-
-                payload = value.get(
-                    "payload"
-                )
-
-                if isinstance(
-                    payload,
-                    dict
-                ):
-
-                    print(
-                        f"  payload keys: "
-                        f"{list(payload.keys())}",
-                        flush=True
-                    )
-
-                    print(
-                        f"  payload op: "
-                        f"{payload.get('op')}",
-                        flush=True
-                    )
-
-                    print(
-                        f"  payload source: "
-                        f"{payload.get('source')}",
-                        flush=True
-                    )
 
         parsed_event = parse_debezium_event(
             event,
@@ -1901,18 +2016,6 @@ def parse_jsonl(
             print(
                 f"  Record ID : "
                 f"{parsed_event['record_id']}",
-                flush=True
-            )
-
-            print(
-                f"  Before    : "
-                f"{parsed_event['before_data']}",
-                flush=True
-            )
-
-            print(
-                f"  After     : "
-                f"{parsed_event['after_data']}",
                 flush=True
             )
 
@@ -2073,7 +2176,6 @@ def parse_cdc_json(
         json_events = []
 
     events = []
-
     ignored = 0
 
     for index, event in enumerate(
@@ -2137,17 +2239,6 @@ def parse_cdc_json(
 
 # ============================================================
 # PARSE SIMPLE CDC CSV
-#
-# Format:
-#
-# event_id,event_type,event_timestamp,table_name,
-# record_id,before_data,after_data,ddl_statement
-#
-# Example:
-#
-# 1,INSERT,13-08-2026 09:00,customers,101,
-# ,{"name":"John","email":"john@example.com","city":"Chennai"},
-#
 # ============================================================
 
 def parse_simple_cdc_csv(
@@ -2207,10 +2298,6 @@ def parse_simple_cdc_csv(
 
                 continue
 
-            # ------------------------------------------------
-            # EVENT ID
-            # ------------------------------------------------
-
             raw_event_id = (
                 csv_row.get(
                     "event_id"
@@ -2227,10 +2314,6 @@ def parse_simple_cdc_csv(
             except Exception:
 
                 event_id = line_number
-
-            # ------------------------------------------------
-            # EVENT TYPE
-            # ------------------------------------------------
 
             raw_event_type = (
                 csv_row.get(
@@ -2255,19 +2338,11 @@ def parse_simple_cdc_csv(
 
                 continue
 
-            # ------------------------------------------------
-            # TIMESTAMP
-            # ------------------------------------------------
-
             event_timestamp = parse_csv_timestamp(
                 csv_row.get(
                     "event_timestamp"
                 )
             )
-
-            # ------------------------------------------------
-            # TABLE
-            # ------------------------------------------------
 
             table_name = (
                 csv_row.get(
@@ -2280,10 +2355,6 @@ def parse_simple_cdc_csv(
 
                 table_name = "unknown"
 
-            # ------------------------------------------------
-            # RECORD ID
-            # ------------------------------------------------
-
             record_id = (
                 csv_row.get(
                     "record_id"
@@ -2295,29 +2366,17 @@ def parse_simple_cdc_csv(
 
                 record_id = None
 
-            # ------------------------------------------------
-            # BEFORE
-            # ------------------------------------------------
-
             before_data = safe_json_value(
                 csv_row.get(
                     "before_data"
                 )
             )
 
-            # ------------------------------------------------
-            # AFTER
-            # ------------------------------------------------
-
             after_data = safe_json_value(
                 csv_row.get(
                     "after_data"
                 )
             )
-
-            # ------------------------------------------------
-            # DDL
-            # ------------------------------------------------
 
             ddl_statement = (
                 csv_row.get(
@@ -2329,10 +2388,6 @@ def parse_simple_cdc_csv(
             if not ddl_statement:
 
                 ddl_statement = None
-
-            # ------------------------------------------------
-            # ROW
-            # ------------------------------------------------
 
             row = {
 
@@ -2395,10 +2450,6 @@ def parse_simple_cdc_csv(
                 row
             )
 
-            # ------------------------------------------------
-            # DEBUG FIRST 3
-            # ------------------------------------------------
-
             if len(rows) <= 3:
 
                 print(
@@ -2442,16 +2493,6 @@ def parse_simple_cdc_csv(
                     flush=True
                 )
 
-                print(
-                    f"  Before    : {before_data}",
-                    flush=True
-                )
-
-                print(
-                    f"  After     : {after_data}",
-                    flush=True
-                )
-
         except Exception as e:
 
             print(
@@ -2492,20 +2533,6 @@ def parse_simple_cdc_csv(
 
 # ============================================================
 # PARSE KAFKA CDC CSV
-#
-# Format:
-#
-# Timestamp (UTC),
-# Topic,
-# Partition,
-# Offset,
-# Operation,
-# Database,
-# Table,
-# Key,
-# Before,
-# After
-#
 # ============================================================
 
 def parse_kafka_cdc_csv(
@@ -2565,19 +2592,11 @@ def parse_kafka_cdc_csv(
 
                 continue
 
-            # ------------------------------------------------
-            # TIMESTAMP
-            # ------------------------------------------------
-
             event_timestamp = parse_csv_timestamp(
                 csv_row.get(
                     "Timestamp (UTC)"
                 )
             )
-
-            # ------------------------------------------------
-            # TOPIC
-            # ------------------------------------------------
 
             topic = (
                 csv_row.get(
@@ -2589,10 +2608,6 @@ def parse_kafka_cdc_csv(
             if not topic:
 
                 topic = None
-
-            # ------------------------------------------------
-            # PARTITION
-            # ------------------------------------------------
 
             partition = None
 
@@ -2620,10 +2635,6 @@ def parse_kafka_cdc_csv(
                         flush=True
                     )
 
-            # ------------------------------------------------
-            # OFFSET
-            # ------------------------------------------------
-
             kafka_offset = None
 
             offset_raw = (
@@ -2650,10 +2661,6 @@ def parse_kafka_cdc_csv(
                         flush=True
                     )
 
-            # ------------------------------------------------
-            # OPERATION
-            # ------------------------------------------------
-
             operation = (
                 csv_row.get(
                     "Operation"
@@ -2676,10 +2683,6 @@ def parse_kafka_cdc_csv(
 
                 continue
 
-            # ------------------------------------------------
-            # DATABASE
-            # ------------------------------------------------
-
             database_name = (
                 csv_row.get(
                     "Database"
@@ -2690,10 +2693,6 @@ def parse_kafka_cdc_csv(
             if not database_name:
 
                 database_name = None
-
-            # ------------------------------------------------
-            # TABLE
-            # ------------------------------------------------
 
             table_name = (
                 csv_row.get(
@@ -2706,19 +2705,11 @@ def parse_kafka_cdc_csv(
 
                 table_name = None
 
-            # ------------------------------------------------
-            # KEY
-            # ------------------------------------------------
-
             key_data = safe_json_value(
                 csv_row.get(
                     "Key"
                 )
             )
-
-            # ------------------------------------------------
-            # BEFORE
-            # ------------------------------------------------
 
             before_data = safe_json_value(
                 csv_row.get(
@@ -2726,19 +2717,11 @@ def parse_kafka_cdc_csv(
                 )
             )
 
-            # ------------------------------------------------
-            # AFTER
-            # ------------------------------------------------
-
             after_data = safe_json_value(
                 csv_row.get(
                     "After"
                 )
             )
-
-            # ------------------------------------------------
-            # TOPIC SCHEMA/TABLE
-            # ------------------------------------------------
 
             schema_name, topic_table = parse_topic(
                 topic,
@@ -2753,10 +2736,6 @@ def parse_kafka_cdc_csv(
             if not table_name:
 
                 table_name = "unknown"
-
-            # ------------------------------------------------
-            # RECORD ID
-            # ------------------------------------------------
 
             record_id = None
 
@@ -2779,15 +2758,7 @@ def parse_kafka_cdc_csv(
                     table_name
                 )
 
-            # ------------------------------------------------
-            # EVENT ID
-            # ------------------------------------------------
-
             event_id = line_number
-
-            # ------------------------------------------------
-            # ROW
-            # ------------------------------------------------
 
             rows.append({
 
@@ -2845,10 +2816,6 @@ def parse_kafka_cdc_csv(
                 "source_file":
                     file_name,
             })
-
-            # ------------------------------------------------
-            # DEBUG
-            # ------------------------------------------------
 
             if len(rows) <= 3:
 
@@ -2924,10 +2891,6 @@ def parse_kafka_cdc_csv(
 
             continue
 
-    # --------------------------------------------------------
-    # SUMMARY
-    # --------------------------------------------------------
-
     operation_counts = {}
 
     for row in rows:
@@ -2981,8 +2944,6 @@ def parse_kafka_cdc_csv(
 
 # ============================================================
 # PARSE CSV
-#
-# Automatically detects BOTH CSV formats.
 # ============================================================
 
 def parse_cdc_csv(
@@ -3037,10 +2998,6 @@ def parse_cdc_csv(
 
         return []
 
-    # --------------------------------------------------------
-    # Normalize headers
-    # --------------------------------------------------------
-
     reader.fieldnames = [
 
         header.strip()
@@ -3060,11 +3017,6 @@ def parse_cdc_csv(
         f"{reader.fieldnames}",
         flush=True
     )
-
-    # ========================================================
-    # FORMAT 1
-    # SIMPLE CDC
-    # ========================================================
 
     simple_columns = {
 
@@ -3086,11 +3038,6 @@ def parse_cdc_csv(
             reader,
             file_name
         )
-
-    # ========================================================
-    # FORMAT 2
-    # KAFKA CDC
-    # ========================================================
 
     kafka_columns = {
 
@@ -3115,10 +3062,6 @@ def parse_cdc_csv(
             file_name
         )
 
-    # ========================================================
-    # UNKNOWN FORMAT
-    # ========================================================
-
     print(
         "",
         flush=True
@@ -3142,39 +3085,6 @@ def parse_cdc_csv(
     )
 
     print(
-        "",
-        flush=True
-    )
-
-    print(
-        "Supported CSV format #1:",
-        flush=True
-    )
-
-    print(
-        "event_id,event_type,event_timestamp,"
-        "table_name,record_id,before_data,"
-        "after_data,ddl_statement",
-        flush=True
-    )
-
-    print(
-        "",
-        flush=True
-    )
-
-    print(
-        "Supported CSV format #2:",
-        flush=True
-    )
-
-    print(
-        "Timestamp (UTC),Topic,Partition,Offset,"
-        "Operation,Database,Table,Key,Before,After",
-        flush=True
-    )
-
-    print(
         "================================================",
         flush=True
     )
@@ -3188,6 +3098,7 @@ def parse_cdc_csv(
 
 def delete_file_events(
     conn,
+    bucket_name,
     file_name
 ):
 
@@ -3196,9 +3107,11 @@ def delete_file_events(
     cursor.execute(
         """
         DELETE FROM cdc_events
-        WHERE source_file = %s
+        WHERE source_bucket = %s
+          AND source_file = %s
         """,
         (
+            bucket_name,
             file_name,
         )
     )
@@ -3217,6 +3130,7 @@ def delete_file_events(
 def insert_events(
     conn,
     rows,
+    bucket_name,
     file_name,
     etag
 ):
@@ -3224,7 +3138,6 @@ def insert_events(
     cursor = conn.cursor()
 
     inserted_count = 0
-
     skipped_count = 0
 
     for row in rows:
@@ -3258,6 +3171,7 @@ def insert_events(
                     source_lsn,
                     source_txid,
 
+                    source_bucket,
                     source_file,
                     source_line_number
 
@@ -3287,6 +3201,7 @@ def insert_events(
                     %s,
                     %s,
 
+                    %s,
                     %s,
                     %s
                 )
@@ -3376,6 +3291,8 @@ def insert_events(
                         "source_txid"
                     ),
 
+                    bucket_name,
+
                     file_name,
 
                     row.get(
@@ -3405,6 +3322,11 @@ def insert_events(
             )
 
             print(
+                f"  Bucket    : {bucket_name}",
+                flush=True
+            )
+
+            print(
                 f"  File      : {file_name}",
                 flush=True
             )
@@ -3422,40 +3344,20 @@ def insert_events(
             )
 
             print(
-                f"  Topic     : "
-                f"{row.get('topic')}",
-                flush=True
-            )
-
-            print(
-                f"  Partition : "
-                f"{row.get('partition_number')}",
-                flush=True
-            )
-
-            print(
-                f"  Offset    : "
-                f"{row.get('kafka_offset')}",
-                flush=True
-            )
-
-            print(
                 f"  Error     : {e}",
                 flush=True
             )
 
             raise
 
-    # --------------------------------------------------------
-    # Mark file processed
-    #
-    # IMPORTANT:
-    # This happens in the same DB transaction as inserts.
-    # --------------------------------------------------------
+    # ========================================================
+    # MARK FILE PROCESSED
+    # ========================================================
 
     cursor.execute(
         """
         INSERT INTO processed_files (
+            bucket_name,
             file_name,
             file_etag,
             processed_at
@@ -3463,9 +3365,13 @@ def insert_events(
         VALUES (
             %s,
             %s,
+            %s,
             CURRENT_TIMESTAMP
         )
-        ON CONFLICT (file_name)
+        ON CONFLICT (
+            bucket_name,
+            file_name
+        )
         DO UPDATE SET
 
             file_etag =
@@ -3475,6 +3381,7 @@ def insert_events(
                 CURRENT_TIMESTAMP
         """,
         (
+            bucket_name,
             file_name,
             etag
         )
@@ -3493,6 +3400,7 @@ def insert_events(
 # ============================================================
 
 def process_file(
+    bucket_name,
     file_name,
     etag
 ):
@@ -3508,7 +3416,8 @@ def process_file(
     )
 
     print(
-        f"PROCESSING FILE: {file_name}",
+        f"PROCESSING FILE: "
+        f"{bucket_name}/{file_name}",
         flush=True
     )
 
@@ -3522,12 +3431,12 @@ def process_file(
         flush=True
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # DOWNLOAD
-    # --------------------------------------------------------
+    # ========================================================
 
     response = s3.get_object(
-        Bucket=MINIO_BUCKET,
+        Bucket=bucket_name,
         Key=file_name
     )
 
@@ -3540,9 +3449,9 @@ def process_file(
         flush=True
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # FORMAT
-    # --------------------------------------------------------
+    # ========================================================
 
     lower_name = file_name.lower()
 
@@ -3616,9 +3525,9 @@ def process_file(
         flush=True
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # NEVER MARK EMPTY PARSE AS PROCESSED
-    # --------------------------------------------------------
+    # ========================================================
 
     if not rows:
 
@@ -3644,19 +3553,21 @@ def process_file(
 
         return False
 
-    # --------------------------------------------------------
+    # ========================================================
     # DATABASE
-    # --------------------------------------------------------
+    # ========================================================
 
     conn = get_db_connection()
 
     try:
 
         previous_etag = get_processed_etag(
+            bucket_name,
             file_name
         )
 
         existing_event_count = count_events_for_file(
+            bucket_name,
             file_name
         )
 
@@ -3676,9 +3587,9 @@ def process_file(
             existing_event_count == 0
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # REBUILD WHEN NEEDED
-        # ----------------------------------------------------
+        # ====================================================
 
         if (
             file_changed
@@ -3720,6 +3631,7 @@ def process_file(
 
             deleted_count = delete_file_events(
                 conn,
+                bucket_name,
                 file_name
             )
 
@@ -3729,9 +3641,9 @@ def process_file(
                 flush=True
             )
 
-        # ----------------------------------------------------
+        # ====================================================
         # INSERT
-        # ----------------------------------------------------
+        # ====================================================
 
         (
             inserted_count,
@@ -3739,19 +3651,14 @@ def process_file(
         ) = insert_events(
             conn,
             rows,
+            bucket_name,
             file_name,
             etag
         )
 
-        # ----------------------------------------------------
-        # Verify before commit
-        #
-        # We need the same transaction to contain:
-        #
-        # CDC rows
-        # processed_files row
-        #
-        # ----------------------------------------------------
+        # ====================================================
+        # VERIFY BEFORE COMMIT
+        # ====================================================
 
         cursor = conn.cursor()
 
@@ -3759,9 +3666,11 @@ def process_file(
             """
             SELECT COUNT(*)
             FROM cdc_events
-            WHERE source_file = %s
+            WHERE source_bucket = %s
+              AND source_file = %s
             """,
             (
+                bucket_name,
                 file_name,
             )
         )
@@ -3779,11 +3688,15 @@ def process_file(
                 "contains ZERO CDC events for this file."
             )
 
+        # ====================================================
+        # COMMIT
+        # ====================================================
+
         conn.commit()
 
-        # ----------------------------------------------------
+        # ====================================================
         # SUCCESS
-        # ----------------------------------------------------
+        # ====================================================
 
         print(
             "",
@@ -3796,7 +3709,8 @@ def process_file(
         )
 
         print(
-            f"SUCCESS: {file_name}",
+            f"SUCCESS: "
+            f"{bucket_name}/{file_name}",
             flush=True
         )
 
@@ -3837,7 +3751,8 @@ def process_file(
         )
 
         print(
-            f"ERROR processing {file_name}: "
+            f"ERROR processing "
+            f"{bucket_name}/{file_name}: "
             f"{e}",
             flush=True
         )
@@ -3850,22 +3765,41 @@ def process_file(
 
 
 # ============================================================
-# SCAN MINIO
+# GET BUCKET LIST
 # ============================================================
 
-def scan_minio():
+def get_minio_buckets():
 
-    continuation_token = None
+    configured_buckets = get_configured_buckets()
 
-    total_objects = 0
+    # ========================================================
+    # EXPLICIT BUCKET CONFIGURATION
+    # ========================================================
 
-    supported_files = 0
+    if configured_buckets:
 
-    processed_this_scan = 0
+        print(
+            "",
+            flush=True
+        )
 
-    skipped_this_scan = 0
+        print(
+            "Using explicitly configured MinIO buckets:",
+            flush=True
+        )
 
-    failed_this_scan = 0
+        for bucket in configured_buckets:
+
+            print(
+                f"  - {bucket}",
+                flush=True
+            )
+
+        return configured_buckets
+
+    # ========================================================
+    # AUTOMATIC DISCOVERY
+    # ========================================================
 
     print(
         "",
@@ -3873,42 +3807,167 @@ def scan_minio():
     )
 
     print(
-        "================================================",
+        "MINIO_BUCKETS is empty.",
         flush=True
     )
 
     print(
-        "SCAN START",
+        "Discovering all buckets accessible "
+        "by the configured MinIO credentials...",
+        flush=True
+    )
+
+    response = s3.list_buckets()
+
+    buckets = []
+
+    for bucket in response.get(
+        "Buckets",
+        []
+    ):
+
+        bucket_name = bucket.get(
+            "Name"
+        )
+
+        if bucket_name:
+
+            buckets.append(
+                bucket_name
+            )
+
+    buckets.sort()
+
+    print(
+        "",
         flush=True
     )
 
     print(
-        f"MinIO bucket: {MINIO_BUCKET}",
+        "Accessible MinIO buckets:",
+        flush=True
+    )
+
+    if not buckets:
+
+        print(
+            "  No buckets found.",
+            flush=True
+        )
+
+    else:
+
+        for bucket in buckets:
+
+            print(
+                f"  - {bucket}",
+                flush=True
+            )
+
+    return buckets
+
+
+# ============================================================
+# CHECK BUCKET ACCESS
+# ============================================================
+
+def check_bucket_access(
+    bucket_name
+):
+
+    try:
+
+        s3.head_bucket(
+            Bucket=bucket_name
+        )
+
+        return True
+
+    except Exception as e:
+
+        print(
+            f"WARNING: Cannot access bucket "
+            f"'{bucket_name}': {e}",
+            flush=True
+        )
+
+        return False
+
+
+# ============================================================
+# SCAN ONE BUCKET
+# ============================================================
+
+def scan_bucket(
+    bucket_name
+):
+
+    continuation_token = None
+
+    total_objects = 0
+    supported_files = 0
+    processed_this_bucket = 0
+    skipped_this_bucket = 0
+    failed_this_bucket = 0
+
+    print(
+        "",
         flush=True
     )
 
     print(
-        f"MinIO prefix: {MINIO_PREFIX}",
+        "################################################",
         flush=True
     )
 
     print(
-        f"Force reprocess this scan: "
-        f"{FORCE_REPROCESS}",
+        f"BUCKET SCAN START: {bucket_name}",
         flush=True
     )
 
     print(
-        "================================================",
+        f"MinIO prefix: "
+        f"{MINIO_PREFIX or '(entire bucket)'}",
         flush=True
     )
+
+    print(
+        "################################################",
+        flush=True
+    )
+
+    # ========================================================
+    # CHECK ACCESS
+    # ========================================================
+
+    if not check_bucket_access(
+        bucket_name
+    ):
+
+        print(
+            f"Skipping inaccessible bucket: "
+            f"{bucket_name}",
+            flush=True
+        )
+
+        return {
+            "objects": 0,
+            "supported": 0,
+            "processed": 0,
+            "skipped": 0,
+            "failed": 1,
+        }
+
+    # ========================================================
+    # PAGINATED OBJECT SCAN
+    # ========================================================
 
     while True:
 
         request = {
 
             "Bucket":
-                MINIO_BUCKET,
+                bucket_name,
 
             "Prefix":
                 MINIO_PREFIX
@@ -3999,13 +4058,14 @@ def scan_minio():
             try:
 
                 process_required = should_process_file(
+                    bucket_name,
                     file_name,
                     etag
                 )
 
             except Exception as e:
 
-                failed_this_scan += 1
+                failed_this_bucket += 1
 
                 print(
                     "",
@@ -4013,7 +4073,8 @@ def scan_minio():
                 )
 
                 print(
-                    f"ERROR checking {file_name}: "
+                    f"ERROR checking "
+                    f"{bucket_name}/{file_name}: "
                     f"{e}",
                     flush=True
                 )
@@ -4022,7 +4083,7 @@ def scan_minio():
 
             if not process_required:
 
-                skipped_this_scan += 1
+                skipped_this_bucket += 1
 
                 continue
 
@@ -4033,21 +4094,22 @@ def scan_minio():
             try:
 
                 success = process_file(
+                    bucket_name,
                     file_name,
                     etag
                 )
 
                 if success:
 
-                    processed_this_scan += 1
+                    processed_this_bucket += 1
 
                 else:
 
-                    failed_this_scan += 1
+                    failed_this_bucket += 1
 
             except Exception as e:
 
-                failed_this_scan += 1
+                failed_this_bucket += 1
 
                 print(
                     "",
@@ -4056,7 +4118,8 @@ def scan_minio():
 
                 print(
                     f"ERROR processing "
-                    f"{file_name}: {e}",
+                    f"{bucket_name}/{file_name}: "
+                    f"{e}",
                     flush=True
                 )
 
@@ -4079,9 +4142,83 @@ def scan_minio():
 
             break
 
-    # --------------------------------------------------------
-    # SUMMARY
-    # --------------------------------------------------------
+    # ========================================================
+    # BUCKET SUMMARY
+    # ========================================================
+
+    print(
+        "",
+        flush=True
+    )
+
+    print(
+        "################################################",
+        flush=True
+    )
+
+    print(
+        f"BUCKET SCAN COMPLETE: {bucket_name}",
+        flush=True
+    )
+
+    print(
+        f"Objects             : "
+        f"{total_objects}",
+        flush=True
+    )
+
+    print(
+        f"Supported files     : "
+        f"{supported_files}",
+        flush=True
+    )
+
+    print(
+        f"Processed            : "
+        f"{processed_this_bucket}",
+        flush=True
+    )
+
+    print(
+        f"Already processed    : "
+        f"{skipped_this_bucket}",
+        flush=True
+    )
+
+    print(
+        f"Failed / retry       : "
+        f"{failed_this_bucket}",
+        flush=True
+    )
+
+    print(
+        "################################################",
+        flush=True
+    )
+
+    return {
+        "objects":
+            total_objects,
+
+        "supported":
+            supported_files,
+
+        "processed":
+            processed_this_bucket,
+
+        "skipped":
+            skipped_this_bucket,
+
+        "failed":
+            failed_this_bucket,
+    }
+
+
+# ============================================================
+# SCAN ALL MINIO BUCKETS
+# ============================================================
+
+def scan_minio():
 
     print(
         "",
@@ -4094,37 +4231,186 @@ def scan_minio():
     )
 
     print(
-        "MinIO scan complete.",
+        "MINIO MULTI-BUCKET SCAN START",
+        flush=True
+    )
+
+    print(
+        f"MinIO endpoint: "
+        f"{MINIO_ENDPOINT}",
+        flush=True
+    )
+
+    print(
+        f"MinIO prefix: "
+        f"{MINIO_PREFIX or '(entire bucket)'}",
+        flush=True
+    )
+
+    print(
+        f"Force reprocess: "
+        f"{FORCE_REPROCESS}",
+        flush=True
+    )
+
+    print(
+        "================================================",
+        flush=True
+    )
+
+    # ========================================================
+    # GET BUCKETS
+    # ========================================================
+
+    try:
+
+        buckets = get_minio_buckets()
+
+    except Exception as e:
+
+        print(
+            "",
+            flush=True
+        )
+
+        print(
+            f"ERROR discovering MinIO buckets: "
+            f"{e}",
+            flush=True
+        )
+
+        return
+
+    # ========================================================
+    # NO BUCKETS
+    # ========================================================
+
+    if not buckets:
+
+        print(
+            "",
+            flush=True
+        )
+
+        print(
+            "WARNING: No MinIO buckets available.",
+            flush=True
+        )
+
+        return
+
+    # ========================================================
+    # GLOBAL COUNTERS
+    # ========================================================
+
+    totals = {
+
+        "objects":
+            0,
+
+        "supported":
+            0,
+
+        "processed":
+            0,
+
+        "skipped":
+            0,
+
+        "failed":
+            0,
+    }
+
+    # ========================================================
+    # SCAN EACH BUCKET
+    # ========================================================
+
+    for bucket_name in buckets:
+
+        try:
+
+            result = scan_bucket(
+                bucket_name
+            )
+
+            for key in totals:
+
+                totals[
+                    key
+                ] += result.get(
+                    key,
+                    0
+                )
+
+        except Exception as e:
+
+            totals[
+                "failed"
+            ] += 1
+
+            print(
+                "",
+                flush=True
+            )
+
+            print(
+                f"ERROR scanning bucket "
+                f"'{bucket_name}': {e}",
+                flush=True
+            )
+
+    # ========================================================
+    # GLOBAL SUMMARY
+    # ========================================================
+
+    print(
+        "",
+        flush=True
+    )
+
+    print(
+        "================================================",
+        flush=True
+    )
+
+    print(
+        "MULTI-BUCKET MINIO SCAN COMPLETE",
+        flush=True
+    )
+
+    print(
+        f"Buckets scanned      : "
+        f"{len(buckets)}",
         flush=True
     )
 
     print(
         f"Objects              : "
-        f"{total_objects}",
+        f"{totals['objects']}",
         flush=True
     )
 
     print(
         f"Supported files      : "
-        f"{supported_files}",
+        f"{totals['supported']}",
         flush=True
     )
 
     print(
         f"Processed this scan  : "
-        f"{processed_this_scan}",
+        f"{totals['processed']}",
         flush=True
     )
 
     print(
         f"Already processed    : "
-        f"{skipped_this_scan}",
+        f"{totals['skipped']}",
         flush=True
     )
 
     print(
         f"Failed / retry       : "
-        f"{failed_this_scan}",
+        f"{totals['failed']}",
         flush=True
     )
 
@@ -4151,7 +4437,7 @@ def main():
     )
 
     print(
-        "CDC PYTHON WORKER",
+        "CDC PYTHON MULTI-BUCKET WORKER",
         flush=True
     )
 
@@ -4166,15 +4452,42 @@ def main():
         flush=True
     )
 
-    print(
-        f"MinIO bucket   : "
-        f"{MINIO_BUCKET}",
-        flush=True
-    )
+    # ========================================================
+    # BUCKET MODE
+    # ========================================================
+
+    configured_buckets = get_configured_buckets()
+
+    if configured_buckets:
+
+        print(
+            "Bucket mode    : EXPLICIT",
+            flush=True
+        )
+
+        print(
+            "Buckets        : "
+            + ", ".join(
+                configured_buckets
+            ),
+            flush=True
+        )
+
+    else:
+
+        print(
+            "Bucket mode    : AUTO DISCOVERY",
+            flush=True
+        )
+
+        print(
+            "Buckets        : ALL ACCESSIBLE BUCKETS",
+            flush=True
+        )
 
     print(
         f"MinIO prefix   : "
-        f"{MINIO_PREFIX}",
+        f"{MINIO_PREFIX or '(entire bucket)'}",
         flush=True
     )
 
@@ -4215,9 +4528,9 @@ def main():
         flush=True
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # DATABASE INITIALIZATION
-    # --------------------------------------------------------
+    # ========================================================
 
     while True:
 
@@ -4249,9 +4562,9 @@ def main():
                 5
             )
 
-    # --------------------------------------------------------
+    # ========================================================
     # CONTINUOUS POLLING
-    # --------------------------------------------------------
+    # ========================================================
 
     while True:
 
