@@ -75,3 +75,7 @@ MinIO API	http://localhost:9100
 Python worker	Runs automatically in Docker
 PostgreSQL	localhost:5433
 7000	cdc-file-picker	Your custom file-picker Python application
+
+
+
+http://127.0.0.1:5000/public/dashboards/8kWEsYWB7ZqBBRul71fsbbgMz3Imb3jAdOuXQWlP?org_slug=default
