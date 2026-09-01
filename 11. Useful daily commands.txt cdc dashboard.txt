@@ -22,3 +22,8 @@ docker exec cdc-python-worker sh -c "grep -n 'Existing CDC events' worker.py"
 
 Check PostgreSQL
 docker exec -it cdc-postgres psql -U redash -d redash
+
+
+
+
+https://youtu.be/jWkgZnhEnrE?si=J9Bx8QfE-HhwlM7s
