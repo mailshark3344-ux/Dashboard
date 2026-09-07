@@ -137,6 +137,14 @@ services:
   #
   # Uses the EXISTING cdc-minio container.
   # cdc-minio is already attached to cdc-dashboard_default.
+  #
+  # Bucket selection:
+  #
+  # MINIO_BUCKETS empty
+  #     -> worker discovers all accessible buckets
+  #
+  # MINIO_BUCKETS=bucket-a,bucket-b
+  #     -> worker scans only those buckets
   # ============================================================
 
   python-worker:
@@ -157,7 +165,12 @@ services:
       MINIO_ENDPOINT: http://cdc-minio:9000
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin123
-      MINIO_BUCKET: myfiles
+
+      # Empty = automatically discover all
+      # buckets accessible with these credentials.
+      MINIO_BUCKETS: ""
+
+      # Empty = scan entire bucket.
       MINIO_PREFIX: ""
 
       # -------------------------
@@ -189,6 +202,9 @@ services:
   # MINIO FILE PICKER
   #
   # Uses the EXISTING cdc-minio container.
+  #
+  # Buckets are NOT configured here.
+  # app.py dynamically lists accessible MinIO buckets.
   # ============================================================
 
   file-picker:
@@ -209,7 +225,13 @@ services:
       MINIO_ENDPOINT: http://cdc-minio:9000
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin123
-      MINIO_BUCKET: myfiles
+
+      # IMPORTANT:
+      # No MINIO_BUCKET here.
+      #
+      # app.py calls list_buckets()
+      # and lets the user select the bucket.
+      # -------------------------
 
       # -------------------------
       # REDASH
