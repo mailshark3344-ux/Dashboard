@@ -51,3 +51,10 @@ minio-data/
 .redash/
 
 postgres/
+
+# Deployment artifacts
+deployment/cdc-dashboard-images.tar
+deployment/redash-backup.sql
+redash-backup.sql
+cdc-dashboard-images.tar
+compose-final.yml

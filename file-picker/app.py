@@ -3,7 +3,7 @@ import os
 from flask import Flask, render_template, request, redirect
 import boto3
 from botocore.client import Config
-from urllib.parse import quote
+from urllib.parse import urlencode
 
 
 # ============================================================
@@ -38,14 +38,51 @@ MINIO_SECRET_KEY = os.getenv(
     "minioadmin123"
 )
 
+MINIO_REGION = os.getenv(
+    "MINIO_REGION",
+    "us-east-1"
+)
+
 
 # ============================================================
 # REDASH
+#
+# Browser-facing Redash URL.
+#
+# IMPORTANT:
+#
+# REDASH_URL is the URL that the user's browser can access.
+#
+# Docker container names such as:
+#
+#     http://redash:5000
+#
+# MUST NOT be used here because the redirect happens in
+# the user's browser.
 # ============================================================
 
 REDASH_URL = os.getenv(
     "REDASH_URL",
-    "http://127.0.0.1:5000/dashboards/1-dashboard"
+    "http://localhost:5000"
+)
+
+
+# ============================================================
+# REDASH DASHBOARD PATH
+#
+# Your dashboard URL is:
+#
+#     http://localhost:5000/dashboards/1-dashboard
+#
+# Therefore:
+#
+#     /dashboards/1-dashboard
+#
+# ============================================================
+
+REDASH_DASHBOARD_PATH = os.getenv(
+    "REDASH_DASHBOARD_PATH",
+    "/dashboards/1-dashboard"
 )
 
 
@@ -61,8 +98,85 @@ s3 = boto3.client(
     config=Config(
         signature_version="s3v4"
     ),
-    region_name="us-east-1"
+    region_name=MINIO_REGION
 )
+
+
+# ============================================================
+# BUILD REDASH DASHBOARD URL
+#
+# This creates a URL like:
+#
+# http://localhost:5000/dashboards/1-dashboard
+#     ?p_source_bucket=myfiles
+#     &p_source_file=cdc%2Fpostgres-connecter.public.employees
+#     %20%283%29.jsonl
+#
+# ============================================================
+
+def build_redash_url(
+    bucket,
+    selected_file
+):
+
+    # --------------------------------------------------------
+    # Remove trailing slash from base URL
+    # --------------------------------------------------------
+
+    base_url = REDASH_URL.rstrip("/")
+
+    # --------------------------------------------------------
+    # Normalize dashboard path
+    # --------------------------------------------------------
+
+    dashboard_path = REDASH_DASHBOARD_PATH.strip()
+
+    if not dashboard_path:
+
+        dashboard_path = "/"
+
+    if not dashboard_path.startswith("/"):
+
+        dashboard_path = (
+            "/" + dashboard_path
+        )
+
+    # --------------------------------------------------------
+    # Dashboard parameters
+    # --------------------------------------------------------
+
+    params = {
+        "p_source_bucket": bucket,
+        "p_source_file": selected_file
+    }
+
+    # --------------------------------------------------------
+    # Encode query parameters correctly
+    #
+    # urlencode handles:
+    #
+    # spaces
+    # /
+    # (
+    # )
+    # etc.
+    # --------------------------------------------------------
+
+    query_string = urlencode(
+        params
+    )
+
+    # --------------------------------------------------------
+    # Final URL
+    # --------------------------------------------------------
+
+    redirect_url = (
+        f"{base_url}"
+        f"{dashboard_path}"
+        f"?{query_string}"
+    )
+
+    return redirect_url
 
 
 # ============================================================
@@ -87,6 +201,7 @@ def list_buckets():
             )
 
             if not bucket_name:
+
                 continue
 
             buckets.append({
@@ -104,6 +219,10 @@ def list_buckets():
         )
 
         raise
+
+    # --------------------------------------------------------
+    # Sort alphabetically
+    # --------------------------------------------------------
 
     buckets.sort(
         key=lambda x: x["name"].lower()
@@ -153,11 +272,11 @@ def bucket_exists(
 #
 # bucket:
 #
-# customer-a
+#     myfiles
 #
 # prefix:
 #
-# cdc/
+#     cdc/
 #
 # ============================================================
 
@@ -167,11 +286,15 @@ def list_objects(
 ):
 
     folders = []
+
     files = []
 
     if not bucket:
 
-        return folders, files
+        return (
+            folders,
+            files
+        )
 
     # --------------------------------------------------------
     # Verify bucket
@@ -202,8 +325,9 @@ def list_objects(
     # Ensure folder prefix ends with /
     # --------------------------------------------------------
 
-    if prefix and not prefix.endswith(
-        "/"
+    if (
+        prefix
+        and not prefix.endswith("/")
     ):
 
         prefix += "/"
@@ -222,6 +346,10 @@ def list_objects(
         Delimiter="/"
     )
 
+    # --------------------------------------------------------
+    # Process pages
+    # --------------------------------------------------------
+
     for page in pages:
 
         # ====================================================
@@ -238,19 +366,26 @@ def list_objects(
             )
 
             if not folder_prefix:
+
                 continue
+
+            # ------------------------------------------------
+            # Remove current prefix
+            # ------------------------------------------------
 
             folder_name = (
                 folder_prefix[len(prefix):]
                 .rstrip("/")
             )
 
-            if folder_name:
+            if not folder_name:
 
-                folders.append({
-                    "name": folder_name,
-                    "prefix": folder_prefix
-                })
+                continue
+
+            folders.append({
+                "name": folder_name,
+                "prefix": folder_prefix
+            })
 
         # ====================================================
         # FILES
@@ -266,6 +401,7 @@ def list_objects(
             )
 
             if not key:
+
                 continue
 
             # ------------------------------------------------
@@ -308,11 +444,14 @@ def list_objects(
 
             files.append({
                 "key": key,
+
                 "name": relative_name,
+
                 "size": item.get(
                     "Size",
                     0
                 ),
+
                 "last_modified": item.get(
                     "LastModified"
                 )
@@ -347,18 +486,25 @@ def list_objects(
     )
 
     # ========================================================
-    # SORT
+    # SORT FOLDERS
     # ========================================================
 
     folders.sort(
         key=lambda x: x["name"].lower()
     )
 
+    # ========================================================
+    # SORT FILES
+    # ========================================================
+
     files.sort(
         key=lambda x: x["name"].lower()
     )
 
-    return folders, files
+    return (
+        folders,
+        files
+    )
 
 
 # ============================================================
@@ -386,7 +532,7 @@ def index():
 #
 # 2. Bucket selected:
 #
-#       /select?bucket=mybucket
+#       /select?bucket=myfiles
 #
 #    Show folders/files inside bucket.
 # ============================================================
@@ -427,12 +573,19 @@ def select_file():
 
         return render_template(
             "select.html",
+
             mode="buckets",
+
             bucket=None,
+
             prefix="",
+
             buckets=buckets,
+
             folders=[],
+
             files=[],
+
             parent_prefix=None
         )
 
@@ -466,6 +619,12 @@ def select_file():
         )
 
     except Exception as e:
+
+        print(
+            f"ERROR reading bucket "
+            f"'{bucket}': {e}",
+            flush=True
+        )
 
         return (
             f"Unable to read bucket "
@@ -525,12 +684,18 @@ def select_file():
 # ============================================================
 # CHOOSE FILE
 #
-# Sends BOTH:
+# This is called when the user presses SELECT.
 #
-#   p_source_bucket
-#   p_source_file
+# Example:
 #
-# to Redash.
+# /choose?bucket=myfiles&file=cdc/test.jsonl
+#
+# It verifies the file and redirects to:
+#
+# /dashboards/1-dashboard
+#     ?p_source_bucket=myfiles
+#     &p_source_file=cdc%2Ftest.jsonl
+#
 # ============================================================
 
 @app.route("/choose")
@@ -581,8 +746,7 @@ def choose_file():
     # ========================================================
     # VERIFY OBJECT
     #
-    # This prevents sending a random/nonexistent object
-    # to Redash.
+    # Prevent sending a random/nonexistent object to Redash.
     # ========================================================
 
     try:
@@ -607,44 +771,17 @@ def choose_file():
         )
 
     # ========================================================
-    # URL ENCODING
-    #
-    # Encode the complete bucket and object key.
+    # BUILD REDASH URL
     # ========================================================
 
-    encoded_bucket = quote(
-        bucket,
-        safe=""
-    )
-
-    encoded_file = quote(
-        selected_file,
-        safe=""
+    redirect_url = build_redash_url(
+        bucket=bucket,
+        selected_file=selected_file
     )
 
     # ========================================================
-    # REDASH REDIRECT
-    #
-    # Example:
-    #
-    # /dashboards/1-dashboard
-    #     ?p_source_bucket=customer_a
-    #     &p_source_file=cdc/data/file.csv
-    #
+    # LOG FILE SELECTION
     # ========================================================
-
-    separator = (
-        "&"
-        if "?" in REDASH_URL
-        else "?"
-    )
-
-    redirect_url = (
-        f"{REDASH_URL}"
-        f"{separator}"
-        f"p_source_bucket={encoded_bucket}"
-        f"&p_source_file={encoded_file}"
-    )
 
     print(
         "",
@@ -657,22 +794,22 @@ def choose_file():
     )
 
     print(
-        "FILE SELECTED",
+        "CDC FILE SELECTED",
         flush=True
     )
 
     print(
-        f"Bucket : {bucket}",
+        f"Bucket       : {bucket}",
         flush=True
     )
 
     print(
-        f"File   : {selected_file}",
+        f"File         : {selected_file}",
         flush=True
     )
 
     print(
-        f"Redirect: {redirect_url}",
+        f"Redash URL   : {redirect_url}",
         flush=True
     )
 
@@ -681,8 +818,13 @@ def choose_file():
         flush=True
     )
 
+    # ========================================================
+    # REDIRECT TO REDASH DASHBOARD
+    # ========================================================
+
     return redirect(
-        redirect_url
+        redirect_url,
+        code=302
     )
 
 
@@ -723,7 +865,11 @@ def health():
             for bucket in buckets
         ],
 
-        "redash": REDASH_URL
+        "redash": REDASH_URL,
+
+        "redash_dashboard": (
+            REDASH_DASHBOARD_PATH
+        )
     }
 
 

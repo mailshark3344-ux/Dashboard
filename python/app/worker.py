@@ -8,6 +8,7 @@ from io import StringIO
 import boto3
 import psycopg2
 from psycopg2.extras import Json
+from botocore.exceptions import ClientError, EndpointConnectionError
 
 
 # ============================================================
@@ -17,90 +18,95 @@ from psycopg2.extras import Json
 MINIO_ENDPOINT = os.getenv(
     "MINIO_ENDPOINT",
     "http://host.docker.internal:9000"
-)
+).strip()
 
 MINIO_ACCESS_KEY = os.getenv(
     "MINIO_ACCESS_KEY",
     "minioadmin"
-)
+).strip()
 
 MINIO_SECRET_KEY = os.getenv(
     "MINIO_SECRET_KEY",
     "minioadmin123"
+).strip()
+
+MINIO_REGION = os.getenv(
+    "MINIO_REGION",
+    "us-east-1"
+).strip()
+
+MINIO_SECURE = (
+    os.getenv(
+        "MINIO_SECURE",
+        "false"
+    ).strip().lower()
+    in (
+        "true",
+        "1",
+        "yes",
+        "y",
+        "on"
+    )
 )
 
 # ------------------------------------------------------------
+# NORMALIZE ENDPOINT
+# ------------------------------------------------------------
+
+if not MINIO_ENDPOINT.startswith(
+    "http://"
+) and not MINIO_ENDPOINT.startswith(
+    "https://"
+):
+
+    protocol = (
+        "https"
+        if MINIO_SECURE
+        else "http"
+    )
+
+    MINIO_ENDPOINT = (
+        f"{protocol}://"
+        f"{MINIO_ENDPOINT}"
+    )
+
+
+MINIO_ENDPOINT = MINIO_ENDPOINT.rstrip("/")
+
+
+# ============================================================
 # BUCKET CONFIGURATION
-# ------------------------------------------------------------
-#
-# Preferred:
-#
-# MINIO_BUCKETS=customer-a,customer-b,cdc-production
-#
-# The worker will scan only these buckets.
-#
-# If MINIO_BUCKETS is empty, the worker will discover all
-# buckets accessible by the configured MinIO credentials.
-#
-# For security, it is recommended to explicitly configure
-# MINIO_BUCKETS rather than allowing automatic discovery.
-#
-# ------------------------------------------------------------
+# ============================================================
 
 MINIO_BUCKETS_RAW = os.getenv(
     "MINIO_BUCKETS",
     ""
 ).strip()
 
-# ------------------------------------------------------------
-# Backward compatibility
-# ------------------------------------------------------------
-#
-# Older configuration used:
-#
-# MINIO_BUCKET=myfiles
-#
-# If MINIO_BUCKETS is not supplied, this value is also accepted.
-#
-# ------------------------------------------------------------
-
 LEGACY_MINIO_BUCKET = os.getenv(
     "MINIO_BUCKET",
     ""
 ).strip()
-
-# ------------------------------------------------------------
-# Legacy bucket used for database migration
-# ------------------------------------------------------------
-#
-# Existing processed_files / cdc_events rows from the old
-# single-bucket implementation need a bucket name.
-#
-# If you previously used "myfiles", this remains the default.
-#
-# ------------------------------------------------------------
 
 LEGACY_DEFAULT_BUCKET = os.getenv(
     "LEGACY_DEFAULT_BUCKET",
     LEGACY_MINIO_BUCKET or "myfiles"
 ).strip()
 
-# ------------------------------------------------------------
+
+# ============================================================
 # PREFIX
-# ------------------------------------------------------------
-#
-# Example:
-#
-# MINIO_PREFIX=cdc data/cdc/
-#
-# Empty means scan the entire bucket.
-#
-# ------------------------------------------------------------
+# ============================================================
 
 MINIO_PREFIX = os.getenv(
     "MINIO_PREFIX",
     ""
-)
+).strip()
+
+
+# ============================================================
+# WORKER CONFIGURATION
+# ============================================================
 
 POLL_INTERVAL = int(
     os.getenv(
@@ -108,42 +114,6 @@ POLL_INTERVAL = int(
         "10"
     )
 )
-
-# ------------------------------------------------------------
-# DATABASE
-# ------------------------------------------------------------
-
-POSTGRES_HOST = os.getenv(
-    "POSTGRES_HOST",
-    "postgres"
-)
-
-POSTGRES_PORT = int(
-    os.getenv(
-        "POSTGRES_PORT",
-        "5432"
-    )
-)
-
-POSTGRES_DB = os.getenv(
-    "POSTGRES_DB",
-    "redash"
-)
-
-POSTGRES_USER = os.getenv(
-    "POSTGRES_USER",
-    "redash"
-)
-
-POSTGRES_PASSWORD = os.getenv(
-    "POSTGRES_PASSWORD",
-    "redashpass"
-)
-
-
-# ============================================================
-# FORCE REPROCESS
-# ============================================================
 
 FORCE_REPROCESS = (
     os.getenv(
@@ -161,21 +131,165 @@ FORCE_REPROCESS = (
 
 
 # ============================================================
-# DISCOVER BUCKETS
+# DATABASE CONFIGURATION
+# ============================================================
+
+POSTGRES_HOST = os.getenv(
+    "POSTGRES_HOST",
+    "postgres"
+).strip()
+
+POSTGRES_PORT = int(
+    os.getenv(
+        "POSTGRES_PORT",
+        "5432"
+    )
+)
+
+POSTGRES_DB = os.getenv(
+    "POSTGRES_DB",
+    "redash"
+).strip()
+
+POSTGRES_USER = os.getenv(
+    "POSTGRES_USER",
+    "redash"
+).strip()
+
+POSTGRES_PASSWORD = os.getenv(
+    "POSTGRES_PASSWORD",
+    "redashpass"
+)
+
+
+# ============================================================
+# SUPPORTED FILE TYPES
+# ============================================================
+
+SUPPORTED_EXTENSIONS = (
+    ".csv",
+    ".json",
+    ".jsonl",
+    ".ndjson",
+)
+
+
+# ============================================================
+# PRINT CONFIGURATION
+# ============================================================
+
+def print_configuration():
+
+    print(
+        "",
+        flush=True
+    )
+
+    print(
+        "============================================================",
+        flush=True
+    )
+
+    print(
+        "CDC PYTHON MINIO WORKER",
+        flush=True
+    )
+
+    print(
+        "============================================================",
+        flush=True
+    )
+
+    print(
+        f"MinIO endpoint : {MINIO_ENDPOINT}",
+        flush=True
+    )
+
+    print(
+        f"MinIO region   : {MINIO_REGION}",
+        flush=True
+    )
+
+    print(
+        f"MinIO secure   : {MINIO_SECURE}",
+        flush=True
+    )
+
+    print(
+        f"Access key     : "
+        f"{'*' * len(MINIO_ACCESS_KEY)}",
+        flush=True
+    )
+
+    configured_buckets = get_configured_buckets()
+
+    if configured_buckets:
+
+        print(
+            "Bucket mode    : EXPLICIT",
+            flush=True
+        )
+
+        print(
+            "Buckets        : "
+            + ", ".join(
+                configured_buckets
+            ),
+            flush=True
+        )
+
+    else:
+
+        print(
+            "Bucket mode    : AUTO DISCOVERY",
+            flush=True
+        )
+
+        print(
+            "Buckets        : ALL ACCESSIBLE BUCKETS",
+            flush=True
+        )
+
+    print(
+        f"MinIO prefix   : "
+        f"{MINIO_PREFIX or '(entire bucket)'}",
+        flush=True
+    )
+
+    print(
+        f"PostgreSQL     : "
+        f"{POSTGRES_HOST}:"
+        f"{POSTGRES_PORT}/"
+        f"{POSTGRES_DB}",
+        flush=True
+    )
+
+    print(
+        f"Poll interval  : {POLL_INTERVAL} seconds",
+        flush=True
+    )
+
+    print(
+        "Supported files: CSV / JSON / JSONL / NDJSON",
+        flush=True
+    )
+
+    print(
+        f"Force reprocess: {FORCE_REPROCESS}",
+        flush=True
+    )
+
+    print(
+        "============================================================",
+        flush=True
+    )
+
+
+# ============================================================
+# BUCKET CONFIGURATION
 # ============================================================
 
 def get_configured_buckets():
-    """
-    Return explicitly configured buckets.
-
-    Priority:
-
-    1. MINIO_BUCKETS
-    2. MINIO_BUCKET
-    3. Empty list
-
-    Empty list means automatic bucket discovery is enabled.
-    """
 
     buckets = []
 
@@ -185,9 +299,14 @@ def get_configured_buckets():
 
             bucket = bucket.strip()
 
-            if bucket and bucket not in buckets:
+            if (
+                bucket
+                and bucket not in buckets
+            ):
 
-                buckets.append(bucket)
+                buckets.append(
+                    bucket
+                )
 
     elif LEGACY_MINIO_BUCKET:
 
@@ -202,13 +321,212 @@ def get_configured_buckets():
 # MINIO CLIENT
 # ============================================================
 
-s3 = boto3.client(
-    "s3",
-    endpoint_url=MINIO_ENDPOINT,
-    aws_access_key_id=MINIO_ACCESS_KEY,
-    aws_secret_access_key=MINIO_SECRET_KEY,
-    region_name="us-east-1",
-)
+def create_minio_client():
+
+    print(
+        "",
+        flush=True
+    )
+
+    print(
+        "Creating MinIO/S3 client...",
+        flush=True
+    )
+
+    print(
+        f"Endpoint: {MINIO_ENDPOINT}",
+        flush=True
+    )
+
+    client = boto3.client(
+        "s3",
+        endpoint_url=MINIO_ENDPOINT,
+        aws_access_key_id=MINIO_ACCESS_KEY,
+        aws_secret_access_key=MINIO_SECRET_KEY,
+        region_name=MINIO_REGION,
+        use_ssl=MINIO_SECURE,
+    )
+
+    return client
+
+
+s3 = create_minio_client()
+
+
+# ============================================================
+# TEST MINIO CONNECTION
+# ============================================================
+
+def test_minio_connection():
+
+    print(
+        "",
+        flush=True
+    )
+
+    print(
+        "============================================================",
+        flush=True
+    )
+
+    print(
+        "TESTING MINIO CONNECTION",
+        flush=True
+    )
+
+    print(
+        f"Endpoint : {MINIO_ENDPOINT}",
+        flush=True
+    )
+
+    print(
+        "============================================================",
+        flush=True
+    )
+
+    try:
+
+        response = s3.list_buckets()
+
+        buckets = []
+
+        for bucket in response.get(
+            "Buckets",
+            []
+        ):
+
+            name = bucket.get(
+                "Name"
+            )
+
+            if name:
+
+                buckets.append(
+                    name
+                )
+
+        buckets.sort()
+
+        print(
+            "MINIO CONNECTION SUCCESS",
+            flush=True
+        )
+
+        print(
+            f"Accessible buckets: {len(buckets)}",
+            flush=True
+        )
+
+        for bucket in buckets:
+
+            print(
+                f"  - {bucket}",
+                flush=True
+            )
+
+        print(
+            "============================================================",
+            flush=True
+        )
+
+        return True
+
+    except EndpointConnectionError as e:
+
+        print(
+            "MINIO CONNECTION FAILED",
+            flush=True
+        )
+
+        print(
+            "Cannot connect to the MinIO endpoint.",
+            flush=True
+        )
+
+        print(
+            f"Endpoint: {MINIO_ENDPOINT}",
+            flush=True
+        )
+
+        print(
+            f"Error: {e}",
+            flush=True
+        )
+
+        print(
+            "",
+            flush=True
+        )
+
+        print(
+            "Check that:",
+            flush=True
+        )
+
+        print(
+            "  1. MinIO is running.",
+            flush=True
+        )
+
+        print(
+            "  2. Port 9000 is reachable.",
+            flush=True
+        )
+
+        print(
+            "  3. MINIO_ENDPOINT is correct.",
+            flush=True
+        )
+
+        print(
+            "  4. Docker can reach the MinIO server.",
+            flush=True
+        )
+
+        return False
+
+    except ClientError as e:
+
+        print(
+            "MINIO AUTHENTICATION / AUTHORIZATION FAILED",
+            flush=True
+        )
+
+        print(
+            f"Endpoint: {MINIO_ENDPOINT}",
+            flush=True
+        )
+
+        print(
+            f"Error: {e}",
+            flush=True
+        )
+
+        print(
+            "",
+            flush=True
+        )
+
+        print(
+            "Check MINIO_ACCESS_KEY and MINIO_SECRET_KEY.",
+            flush=True
+        )
+
+        return False
+
+    except Exception as e:
+
+        print(
+            "MINIO CONNECTION FAILED",
+            flush=True
+        )
+
+        print(
+            f"Error: {e}",
+            flush=True
+        )
+
+        return False
 
 
 # ============================================================
@@ -223,6 +541,7 @@ def get_db_connection():
         database=POSTGRES_DB,
         user=POSTGRES_USER,
         password=POSTGRES_PASSWORD,
+        connect_timeout=10,
     )
 
 
@@ -252,10 +571,6 @@ def initialize_database():
             """
         )
 
-        # ====================================================
-        # ADD BUCKET COLUMN
-        # ====================================================
-
         cursor.execute(
             """
             ALTER TABLE processed_files
@@ -264,13 +579,7 @@ def initialize_database():
         )
 
         # ====================================================
-        # MIGRATE EXISTING processed_files
-        #
-        # Old version had:
-        #
-        # file_name PRIMARY KEY
-        #
-        # Assign old records to LEGACY_DEFAULT_BUCKET.
+        # MIGRATE OLD RECORDS
         # ====================================================
 
         if LEGACY_DEFAULT_BUCKET:
@@ -286,10 +595,6 @@ def initialize_database():
                 )
             )
 
-        # ====================================================
-        # REMOVE NULLS
-        # ====================================================
-
         cursor.execute(
             """
             UPDATE processed_files
@@ -297,10 +602,6 @@ def initialize_database():
             WHERE bucket_name IS NULL
             """
         )
-
-        # ====================================================
-        # MAKE bucket_name NOT NULL
-        # ====================================================
 
         cursor.execute(
             """
@@ -310,15 +611,7 @@ def initialize_database():
         )
 
         # ====================================================
-        # DROP OLD PRIMARY KEY
-        # ====================================================
-        #
-        # Older installation normally created:
-        #
-        # processed_files_pkey
-        #
-        # We remove it so bucket + file can become the key.
-        #
+        # OLD PRIMARY KEY
         # ====================================================
 
         cursor.execute(
@@ -329,10 +622,7 @@ def initialize_database():
         )
 
         # ====================================================
-        # REMOVE POSSIBLE DUPLICATES
-        #
-        # This protects migration if duplicate rows somehow
-        # exist for the same bucket/file.
+        # REMOVE DUPLICATES
         # ====================================================
 
         cursor.execute(
@@ -517,7 +807,7 @@ def initialize_database():
             )
 
         # ====================================================
-        # MIGRATE EXISTING CDC EVENTS
+        # MIGRATE OLD CDC RECORDS
         # ====================================================
 
         if LEGACY_DEFAULT_BUCKET:
@@ -537,55 +827,44 @@ def initialize_database():
         # INDEXES
         # ====================================================
 
-        cursor.execute(
+        indexes = [
+
             """
             CREATE INDEX IF NOT EXISTS
             idx_cdc_events_timestamp
             ON cdc_events(event_timestamp);
-            """
-        )
+            """,
 
-        cursor.execute(
             """
             CREATE INDEX IF NOT EXISTS
             idx_cdc_events_type
             ON cdc_events(event_type);
-            """
-        )
+            """,
 
-        cursor.execute(
             """
             CREATE INDEX IF NOT EXISTS
             idx_cdc_events_table
             ON cdc_events(table_name);
-            """
-        )
+            """,
 
-        cursor.execute(
             """
             CREATE INDEX IF NOT EXISTS
             idx_cdc_events_record
             ON cdc_events(record_id);
-            """
-        )
+            """,
 
-        cursor.execute(
             """
             CREATE INDEX IF NOT EXISTS
             idx_cdc_events_source_file
             ON cdc_events(source_file);
-            """
-        )
+            """,
 
-        cursor.execute(
             """
             CREATE INDEX IF NOT EXISTS
             idx_cdc_events_source_bucket
             ON cdc_events(source_bucket);
-            """
-        )
+            """,
 
-        cursor.execute(
             """
             CREATE INDEX IF NOT EXISTS
             idx_cdc_events_source_bucket_file
@@ -593,10 +872,8 @@ def initialize_database():
                 source_bucket,
                 source_file
             );
-            """
-        )
+            """,
 
-        cursor.execute(
             """
             CREATE INDEX IF NOT EXISTS
             idx_cdc_events_topic_partition_offset
@@ -606,10 +883,16 @@ def initialize_database():
                 kafka_offset
             );
             """
-        )
+        ]
+
+        for statement in indexes:
+
+            cursor.execute(
+                statement
+            )
 
         # ====================================================
-        # REMOVE OLD UNIQUE INDEXES
+        # OLD UNIQUE INDEXES
         # ====================================================
 
         cursor.execute(
@@ -634,7 +917,7 @@ def initialize_database():
         )
 
         # ====================================================
-        # KAFKA EVENT UNIQUE INDEX
+        # KAFKA UNIQUE INDEX
         # ====================================================
 
         cursor.execute(
@@ -656,7 +939,7 @@ def initialize_database():
         )
 
         # ====================================================
-        # NON-KAFKA FALLBACK UNIQUE INDEX
+        # NON-KAFKA UNIQUE INDEX
         # ====================================================
 
         cursor.execute(
@@ -699,7 +982,7 @@ def initialize_database():
 
 
 # ============================================================
-# GET PROCESSED FILE INFORMATION
+# GET PROCESSED FILE INFO
 # ============================================================
 
 def get_processed_file_info(
@@ -799,13 +1082,9 @@ def count_events_for_file(
 
         cursor.close()
 
-        if result:
-
-            return int(
-                result[0]
-            )
-
-        return 0
+        return int(
+            result[0]
+        ) if result else 0
 
     finally:
 
@@ -837,10 +1116,6 @@ def should_process_file(
         flush=True
     )
 
-    # --------------------------------------------------------
-    # FORCE
-    # --------------------------------------------------------
-
     if FORCE_REPROCESS:
 
         print(
@@ -850,18 +1125,10 @@ def should_process_file(
 
         return True
 
-    # --------------------------------------------------------
-    # GET PREVIOUS
-    # --------------------------------------------------------
-
     info = get_processed_file_info(
         bucket_name,
         file_name
     )
-
-    # --------------------------------------------------------
-    # NEVER PROCESSED
-    # --------------------------------------------------------
 
     if info is None:
 
@@ -875,10 +1142,6 @@ def should_process_file(
     previous_etag = info.get(
         "etag"
     )
-
-    # --------------------------------------------------------
-    # ETAG CHANGED
-    # --------------------------------------------------------
 
     if previous_etag != etag:
 
@@ -899,42 +1162,25 @@ def should_process_file(
 
         return True
 
-    # --------------------------------------------------------
-    # SAME ETAG
-    # --------------------------------------------------------
-
     event_count = count_events_for_file(
         bucket_name,
         file_name
     )
 
     print(
-        f"  Existing CDC events: {event_count}",
+        f"Existing CDC events: {event_count}",
         flush=True
     )
-
-    # --------------------------------------------------------
-    # REPAIR
-    # --------------------------------------------------------
 
     if event_count == 0:
 
         print(
-            "PROCESS: File is marked processed but "
-            "has ZERO CDC events.",
-            flush=True
-        )
-
-        print(
-            "PROCESS: Reprocessing file.",
+            "PROCESS: File was marked processed "
+            "but has zero CDC events.",
             flush=True
         )
 
         return True
-
-    # --------------------------------------------------------
-    # NORMAL SKIP
-    # --------------------------------------------------------
 
     print(
         f"SKIP: {bucket_name}/{file_name}",
@@ -975,10 +1221,6 @@ def convert_timestamp_ms(
 
         return None
 
-
-# ============================================================
-# MICROSECONDS TIMESTAMP
-# ============================================================
 
 def convert_timestamp_us(
     value
@@ -1028,39 +1270,25 @@ def parse_csv_timestamp(
 
         return None
 
-    # --------------------------------------------------------
-    # DD-MM-YYYY HH:MM
-    # --------------------------------------------------------
+    formats = [
+        "%d-%m-%Y %H:%M",
+        "%d-%m-%Y %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+    ]
 
-    try:
+    for fmt in formats:
 
-        return datetime.strptime(
-            value,
-            "%d-%m-%Y %H:%M"
-        )
+        try:
 
-    except ValueError:
+            return datetime.strptime(
+                value,
+                fmt
+            )
 
-        pass
+        except ValueError:
 
-    # --------------------------------------------------------
-    # DD-MM-YYYY HH:MM:SS
-    # --------------------------------------------------------
-
-    try:
-
-        return datetime.strptime(
-            value,
-            "%d-%m-%Y %H:%M:%S"
-        )
-
-    except ValueError:
-
-        pass
-
-    # --------------------------------------------------------
-    # ISO
-    # --------------------------------------------------------
+            pass
 
     try:
 
@@ -1094,10 +1322,6 @@ def parse_csv_timestamp(
     except Exception:
 
         pass
-
-    # --------------------------------------------------------
-    # Epoch milliseconds
-    # --------------------------------------------------------
 
     return convert_timestamp_ms(
         value
@@ -1238,23 +1462,14 @@ def find_record_id(
     candidates = [
 
         "id",
-
         "emp_id",
-
         "employee_id",
-
         "customer_id",
-
         "order_id",
-
         "user_id",
-
         "product_id",
-
         "account_id",
-
         "record_id",
-
         f"{table_name}_id",
     ]
 
@@ -1262,9 +1477,7 @@ def find_record_id(
 
         if key in record:
 
-            value = record[
-                key
-            ]
+            value = record[key]
 
             if value is not None:
 
@@ -1376,20 +1589,16 @@ def get_payload(
 
             if (
                 "op" in payload
-                or
-                "before" in payload
-                or
-                "after" in payload
+                or "before" in payload
+                or "after" in payload
             ):
 
                 return payload
 
         if (
             "op" in value
-            or
-            "before" in value
-            or
-            "after" in value
+            or "before" in value
+            or "after" in value
         ):
 
             return value
@@ -1405,20 +1614,16 @@ def get_payload(
 
         if (
             "op" in payload
-            or
-            "before" in payload
-            or
-            "after" in payload
+            or "before" in payload
+            or "after" in payload
         ):
 
             return payload
 
     if (
         "op" in event
-        or
-        "before" in event
-        or
-        "after" in event
+        or "before" in event
+        or "after" in event
     ):
 
         return event
@@ -1698,12 +1903,10 @@ def parse_debezium_event(
         table_name
     )
 
-    event_id = line_number
-
     return {
 
         "event_id":
-            event_id,
+            line_number,
 
         "event_type":
             event_type,
@@ -1785,19 +1988,13 @@ def parse_jsonl(
     except Exception as e:
 
         print(
-            f"ERROR decoding JSONL "
-            f"{file_name}: {e}",
+            f"ERROR decoding JSONL {file_name}: {e}",
             flush=True
         )
 
         return []
 
     if not text.strip():
-
-        print(
-            "JSONL file is empty.",
-            flush=True
-        )
 
         return []
 
@@ -1850,48 +2047,6 @@ def parse_jsonl(
 
             continue
 
-        if total_lines == 1:
-
-            print(
-                "",
-                flush=True
-            )
-
-            print(
-                "FIRST JSONL RECORD:",
-                flush=True
-            )
-
-            print(
-                f"  Top-level keys: "
-                f"{list(event.keys())}",
-                flush=True
-            )
-
-            print(
-                f"  topic: "
-                f"{event.get('topic')}",
-                flush=True
-            )
-
-            print(
-                f"  partition: "
-                f"{event.get('partition')}",
-                flush=True
-            )
-
-            print(
-                f"  offset: "
-                f"{event.get('offset')}",
-                flush=True
-            )
-
-            print(
-                f"  tsMs: "
-                f"{event.get('tsMs')}",
-                flush=True
-            )
-
         parsed_event = parse_debezium_event(
             event,
             file_name,
@@ -1901,25 +2056,6 @@ def parse_jsonl(
         if parsed_event is None:
 
             ignored_lines += 1
-
-            if ignored_lines <= 5:
-
-                print(
-                    "",
-                    flush=True
-                )
-
-                print(
-                    f"IGNORED JSONL line "
-                    f"{line_number}",
-                    flush=True
-                )
-
-                print(
-                    f"  top-level keys: "
-                    f"{list(event.keys())}",
-                    flush=True
-                )
 
             continue
 
@@ -1941,84 +2077,6 @@ def parse_jsonl(
             + 1
         )
 
-        if len(events) <= 3:
-
-            print(
-                "",
-                flush=True
-            )
-
-            print(
-                f"PARSED EVENT #{len(events)}",
-                flush=True
-            )
-
-            print(
-                f"  Line      : "
-                f"{line_number}",
-                flush=True
-            )
-
-            print(
-                f"  Event ID  : "
-                f"{parsed_event['event_id']}",
-                flush=True
-            )
-
-            print(
-                f"  Timestamp : "
-                f"{parsed_event['event_timestamp']}",
-                flush=True
-            )
-
-            print(
-                f"  Topic     : "
-                f"{parsed_event['topic']}",
-                flush=True
-            )
-
-            print(
-                f"  Partition : "
-                f"{parsed_event['partition_number']}",
-                flush=True
-            )
-
-            print(
-                f"  Offset    : "
-                f"{parsed_event['kafka_offset']}",
-                flush=True
-            )
-
-            print(
-                f"  Operation : "
-                f"{parsed_event['event_type']}",
-                flush=True
-            )
-
-            print(
-                f"  Database  : "
-                f"{parsed_event['database_name']}",
-                flush=True
-            )
-
-            print(
-                f"  Schema    : "
-                f"{parsed_event['schema_name']}",
-                flush=True
-            )
-
-            print(
-                f"  Table     : "
-                f"{parsed_event['table_name']}",
-                flush=True
-            )
-
-            print(
-                f"  Record ID : "
-                f"{parsed_event['record_id']}",
-                flush=True
-            )
-
     print(
         "",
         flush=True
@@ -2035,27 +2093,27 @@ def parse_jsonl(
     )
 
     print(
-        f"Total lines          : {total_lines}",
+        f"Total lines        : {total_lines}",
         flush=True
     )
 
     print(
-        f"CDC events parsed    : {len(events)}",
+        f"CDC events parsed  : {len(events)}",
         flush=True
     )
 
     print(
-        f"Invalid JSON lines   : {invalid_lines}",
+        f"Invalid JSON lines : {invalid_lines}",
         flush=True
     )
 
     print(
-        f"Ignored lines        : {ignored_lines}",
+        f"Ignored lines      : {ignored_lines}",
         flush=True
     )
 
     print(
-        f"Operations           : {operation_counts}",
+        f"Operations         : {operation_counts}",
         flush=True
     )
 
@@ -2090,19 +2148,13 @@ def parse_cdc_json(
     except Exception as e:
 
         print(
-            f"ERROR decoding JSON "
-            f"{file_name}: {e}",
+            f"ERROR decoding JSON {file_name}: {e}",
             flush=True
         )
 
         return []
 
     if not text:
-
-        print(
-            "JSON file is empty.",
-            flush=True
-        )
 
         return []
 
@@ -2215,17 +2267,17 @@ def parse_cdc_json(
     )
 
     print(
-        f"Objects found        : {len(json_events)}",
+        f"Objects found      : {len(json_events)}",
         flush=True
     )
 
     print(
-        f"CDC events parsed    : {len(events)}",
+        f"CDC events parsed  : {len(events)}",
         flush=True
     )
 
     print(
-        f"Ignored objects      : {ignored}",
+        f"Ignored objects    : {ignored}",
         flush=True
     )
 
@@ -2238,7 +2290,7 @@ def parse_cdc_json(
 
 
 # ============================================================
-# PARSE SIMPLE CDC CSV
+# SIMPLE CDC CSV
 # ============================================================
 
 def parse_simple_cdc_csv(
@@ -2329,13 +2381,6 @@ def parse_simple_cdc_csv(
 
             if event_type == "UNKNOWN":
 
-                print(
-                    f"WARNING: Unknown event type "
-                    f"'{raw_event_type}' "
-                    f"on line {line_number}",
-                    flush=True
-                )
-
                 continue
 
             event_timestamp = parse_csv_timestamp(
@@ -2389,7 +2434,7 @@ def parse_simple_cdc_csv(
 
                 ddl_statement = None
 
-            row = {
+            rows.append({
 
                 "event_id":
                     event_id,
@@ -2444,54 +2489,7 @@ def parse_simple_cdc_csv(
 
                 "source_file":
                     file_name,
-            }
-
-            rows.append(
-                row
-            )
-
-            if len(rows) <= 3:
-
-                print(
-                    "",
-                    flush=True
-                )
-
-                print(
-                    f"PARSED SIMPLE CDC EVENT "
-                    f"#{len(rows)}",
-                    flush=True
-                )
-
-                print(
-                    f"  Line      : {line_number}",
-                    flush=True
-                )
-
-                print(
-                    f"  Event ID  : {event_id}",
-                    flush=True
-                )
-
-                print(
-                    f"  Timestamp : {event_timestamp}",
-                    flush=True
-                )
-
-                print(
-                    f"  Operation : {event_type}",
-                    flush=True
-                )
-
-                print(
-                    f"  Table     : {table_name}",
-                    flush=True
-                )
-
-                print(
-                    f"  Record ID : {record_id}",
-                    flush=True
-                )
+            })
 
         except Exception as e:
 
@@ -2501,30 +2499,8 @@ def parse_simple_cdc_csv(
                 flush=True
             )
 
-            continue
-
     print(
-        "",
-        flush=True
-    )
-
-    print(
-        "================================================",
-        flush=True
-    )
-
-    print(
-        f"Simple CDC CSV parsing complete: {file_name}",
-        flush=True
-    )
-
-    print(
-        f"CDC events parsed: {len(rows)}",
-        flush=True
-    )
-
-    print(
-        "================================================",
+        f"Simple CDC CSV events: {len(rows)}",
         flush=True
     )
 
@@ -2532,7 +2508,7 @@ def parse_simple_cdc_csv(
 
 
 # ============================================================
-# PARSE KAFKA CDC CSV
+# KAFKA CDC CSV
 # ============================================================
 
 def parse_kafka_cdc_csv(
@@ -2605,9 +2581,7 @@ def parse_kafka_cdc_csv(
                 or ""
             ).strip()
 
-            if not topic:
-
-                topic = None
+            topic = topic or None
 
             partition = None
 
@@ -2628,12 +2602,7 @@ def parse_kafka_cdc_csv(
 
                 except ValueError:
 
-                    print(
-                        f"WARNING: Invalid partition "
-                        f"'{partition_raw}' "
-                        f"line {line_number}",
-                        flush=True
-                    )
+                    pass
 
             kafka_offset = None
 
@@ -2654,12 +2623,7 @@ def parse_kafka_cdc_csv(
 
                 except ValueError:
 
-                    print(
-                        f"WARNING: Invalid offset "
-                        f"'{offset_raw}' "
-                        f"line {line_number}",
-                        flush=True
-                    )
+                    pass
 
             operation = (
                 csv_row.get(
@@ -2674,13 +2638,6 @@ def parse_kafka_cdc_csv(
 
             if event_type is None:
 
-                print(
-                    f"WARNING: Unknown operation "
-                    f"'{operation}' "
-                    f"line {line_number}",
-                    flush=True
-                )
-
                 continue
 
             database_name = (
@@ -2690,9 +2647,10 @@ def parse_kafka_cdc_csv(
                 or ""
             ).strip()
 
-            if not database_name:
-
-                database_name = None
+            database_name = (
+                database_name
+                or None
+            )
 
             table_name = (
                 csv_row.get(
@@ -2701,9 +2659,10 @@ def parse_kafka_cdc_csv(
                 or ""
             ).strip()
 
-            if not table_name:
-
-                table_name = None
+            table_name = (
+                table_name
+                or None
+            )
 
             key_data = safe_json_value(
                 csv_row.get(
@@ -2758,12 +2717,10 @@ def parse_kafka_cdc_csv(
                     table_name
                 )
 
-            event_id = line_number
-
             rows.append({
 
                 "event_id":
-                    event_id,
+                    line_number,
 
                 "event_type":
                     event_type,
@@ -2817,125 +2774,16 @@ def parse_kafka_cdc_csv(
                     file_name,
             })
 
-            if len(rows) <= 3:
-
-                print(
-                    "",
-                    flush=True
-                )
-
-                print(
-                    f"PARSED KAFKA CSV EVENT "
-                    f"#{len(rows)}",
-                    flush=True
-                )
-
-                print(
-                    f"  Line      : {line_number}",
-                    flush=True
-                )
-
-                print(
-                    f"  Timestamp : {event_timestamp}",
-                    flush=True
-                )
-
-                print(
-                    f"  Topic     : {topic}",
-                    flush=True
-                )
-
-                print(
-                    f"  Partition : {partition}",
-                    flush=True
-                )
-
-                print(
-                    f"  Offset    : {kafka_offset}",
-                    flush=True
-                )
-
-                print(
-                    f"  Operation : {event_type}",
-                    flush=True
-                )
-
-                print(
-                    f"  Database  : {database_name}",
-                    flush=True
-                )
-
-                print(
-                    f"  Schema    : {schema_name}",
-                    flush=True
-                )
-
-                print(
-                    f"  Table     : {table_name}",
-                    flush=True
-                )
-
-                print(
-                    f"  Record ID : {record_id}",
-                    flush=True
-                )
-
         except Exception as e:
 
             print(
                 f"ERROR parsing Kafka CSV "
-                f"{file_name}, "
-                f"line {line_number}: {e}",
+                f"{file_name}, line {line_number}: {e}",
                 flush=True
             )
 
-            continue
-
-    operation_counts = {}
-
-    for row in rows:
-
-        operation = row[
-            "event_type"
-        ]
-
-        operation_counts[
-            operation
-        ] = (
-            operation_counts.get(
-                operation,
-                0
-            )
-            + 1
-        )
-
     print(
-        "",
-        flush=True
-    )
-
-    print(
-        "================================================",
-        flush=True
-    )
-
-    print(
-        f"Kafka CDC CSV parsing complete: {file_name}",
-        flush=True
-    )
-
-    print(
-        f"Total CDC events parsed: {len(rows)}",
-        flush=True
-    )
-
-    print(
-        f"Operations: {operation_counts}",
-        flush=True
-    )
-
-    print(
-        "================================================",
+        f"Kafka CDC CSV events: {len(rows)}",
         flush=True
     )
 
@@ -2965,8 +2813,7 @@ def parse_cdc_csv(
     except Exception as e:
 
         print(
-            f"ERROR decoding CSV "
-            f"{file_name}: {e}",
+            f"ERROR decoding CSV: {e}",
             flush=True
         )
 
@@ -2974,19 +2821,10 @@ def parse_cdc_csv(
 
     if not text.strip():
 
-        print(
-            "CSV file is empty.",
-            flush=True
-        )
-
         return []
 
-    csv_stream = StringIO(
-        text
-    )
-
     reader = csv.DictReader(
-        csv_stream
+        StringIO(text)
     )
 
     if not reader.fieldnames:
@@ -3005,17 +2843,10 @@ def parse_cdc_csv(
         else None
 
         for header in reader.fieldnames
-
     ]
 
     headers = set(
         reader.fieldnames
-    )
-
-    print(
-        f"CSV headers detected: "
-        f"{reader.fieldnames}",
-        flush=True
     )
 
     simple_columns = {
@@ -3063,29 +2894,12 @@ def parse_cdc_csv(
         )
 
     print(
-        "",
+        "ERROR: Unsupported CSV format.",
         flush=True
     )
 
     print(
-        "================================================",
-        flush=True
-    )
-
-    print(
-        f"ERROR: Unsupported CSV format: "
-        f"{file_name}",
-        flush=True
-    )
-
-    print(
-        f"Detected columns: "
-        f"{reader.fieldnames}",
-        flush=True
-    )
-
-    print(
-        "================================================",
+        f"Headers: {reader.fieldnames}",
         flush=True
     )
 
@@ -3093,7 +2907,7 @@ def parse_cdc_csv(
 
 
 # ============================================================
-# DELETE OLD EVENTS FOR FILE
+# DELETE EVENTS FOR FILE
 # ============================================================
 
 def delete_file_events(
@@ -3116,11 +2930,11 @@ def delete_file_events(
         )
     )
 
-    deleted_count = cursor.rowcount
+    count = cursor.rowcount
 
     cursor.close()
 
-    return deleted_count
+    return count
 
 
 # ============================================================
@@ -3142,213 +2956,165 @@ def insert_events(
 
     for row in rows:
 
-        try:
+        before_data = row.get(
+            "before_data"
+        )
 
-            cursor.execute(
-                """
-                INSERT INTO cdc_events (
+        after_data = row.get(
+            "after_data"
+        )
 
-                    event_id,
-                    event_type,
-                    event_timestamp,
+        cursor.execute(
+            """
+            INSERT INTO cdc_events (
 
-                    topic,
-                    partition_number,
-                    kafka_offset,
+                event_id,
+                event_type,
+                event_timestamp,
 
-                    database_name,
-                    schema_name,
-                    table_name,
+                topic,
+                partition_number,
+                kafka_offset,
 
-                    record_id,
+                database_name,
+                schema_name,
+                table_name,
 
-                    before_data,
-                    after_data,
+                record_id,
 
-                    ddl_statement,
+                before_data,
+                after_data,
 
-                    snapshot,
-                    source_lsn,
-                    source_txid,
+                ddl_statement,
 
-                    source_bucket,
-                    source_file,
-                    source_line_number
+                snapshot,
+                source_lsn,
+                source_txid,
 
-                )
-                VALUES (
+                source_bucket,
+                source_file,
+                source_line_number
 
-                    %s,
-                    %s,
-                    %s,
+            )
+            VALUES (
 
-                    %s,
-                    %s,
-                    %s,
+                %s,
+                %s,
+                %s,
 
-                    %s,
-                    %s,
-                    %s,
+                %s,
+                %s,
+                %s,
 
-                    %s,
+                %s,
+                %s,
+                %s,
 
-                    %s,
-                    %s,
+                %s,
 
-                    %s,
+                %s,
+                %s,
 
-                    %s,
-                    %s,
-                    %s,
+                %s,
 
-                    %s,
-                    %s,
-                    %s
-                )
+                %s,
+                %s,
+                %s,
 
-                ON CONFLICT DO NOTHING
-                """,
+                %s,
+                %s,
+                %s
+            )
+
+            ON CONFLICT DO NOTHING
+            """,
+            (
+
+                row.get(
+                    "event_id"
+                ),
+
+                row.get(
+                    "event_type"
+                ),
+
+                row.get(
+                    "event_timestamp"
+                ),
+
+                row.get(
+                    "topic"
+                ),
+
+                row.get(
+                    "partition_number"
+                ),
+
+                row.get(
+                    "kafka_offset"
+                ),
+
+                row.get(
+                    "database_name"
+                ),
+
+                row.get(
+                    "schema_name"
+                ),
+
+                row.get(
+                    "table_name"
+                ),
+
+                row.get(
+                    "record_id"
+                ),
 
                 (
+                    Json(before_data)
+                    if before_data is not None
+                    else None
+                ),
 
-                    row.get(
-                        "event_id"
-                    ),
+                (
+                    Json(after_data)
+                    if after_data is not None
+                    else None
+                ),
 
-                    row.get(
-                        "event_type"
-                    ),
+                row.get(
+                    "ddl_statement"
+                ),
 
-                    row.get(
-                        "event_timestamp"
-                    ),
+                row.get(
+                    "snapshot"
+                ),
 
-                    row.get(
-                        "topic"
-                    ),
+                row.get(
+                    "source_lsn"
+                ),
 
-                    row.get(
-                        "partition_number"
-                    ),
+                row.get(
+                    "source_txid"
+                ),
 
-                    row.get(
-                        "kafka_offset"
-                    ),
+                bucket_name,
 
-                    row.get(
-                        "database_name"
-                    ),
+                file_name,
 
-                    row.get(
-                        "schema_name"
-                    ),
-
-                    row.get(
-                        "table_name"
-                    ),
-
-                    row.get(
-                        "record_id"
-                    ),
-
-                    (
-                        Json(
-                            row.get(
-                                "before_data"
-                            )
-                        )
-                        if row.get(
-                            "before_data"
-                        ) is not None
-                        else None
-                    ),
-
-                    (
-                        Json(
-                            row.get(
-                                "after_data"
-                            )
-                        )
-                        if row.get(
-                            "after_data"
-                        ) is not None
-                        else None
-                    ),
-
-                    row.get(
-                        "ddl_statement"
-                    ),
-
-                    row.get(
-                        "snapshot"
-                    ),
-
-                    row.get(
-                        "source_lsn"
-                    ),
-
-                    row.get(
-                        "source_txid"
-                    ),
-
-                    bucket_name,
-
-                    file_name,
-
-                    row.get(
-                        "source_line_number"
-                    ),
-                )
+                row.get(
+                    "source_line_number"
+                ),
             )
+        )
 
-            if cursor.rowcount == 1:
+        if cursor.rowcount == 1:
 
-                inserted_count += 1
+            inserted_count += 1
 
-            else:
+        else:
 
-                skipped_count += 1
-
-        except Exception as e:
-
-            print(
-                "",
-                flush=True
-            )
-
-            print(
-                "ERROR INSERTING CDC EVENT",
-                flush=True
-            )
-
-            print(
-                f"  Bucket    : {bucket_name}",
-                flush=True
-            )
-
-            print(
-                f"  File      : {file_name}",
-                flush=True
-            )
-
-            print(
-                f"  Event ID  : "
-                f"{row.get('event_id')}",
-                flush=True
-            )
-
-            print(
-                f"  Operation : "
-                f"{row.get('event_type')}",
-                flush=True
-            )
-
-            print(
-                f"  Error     : {e}",
-                flush=True
-            )
-
-            raise
+            skipped_count += 1
 
     # ========================================================
     # MARK FILE PROCESSED
@@ -3383,7 +3149,7 @@ def insert_events(
         (
             bucket_name,
             file_name,
-            etag
+            etag,
         )
     )
 
@@ -3396,7 +3162,7 @@ def insert_events(
 
 
 # ============================================================
-# PROCESS FILE
+# PROCESS ONE FILE
 # ============================================================
 
 def process_file(
@@ -3411,13 +3177,12 @@ def process_file(
     )
 
     print(
-        "================================================",
+        "============================================================",
         flush=True
     )
 
     print(
-        f"PROCESSING FILE: "
-        f"{bucket_name}/{file_name}",
+        f"PROCESSING: {bucket_name}/{file_name}",
         flush=True
     )
 
@@ -3427,31 +3192,35 @@ def process_file(
     )
 
     print(
-        "================================================",
+        "============================================================",
         flush=True
     )
 
-    # ========================================================
-    # DOWNLOAD
-    # ========================================================
+    try:
 
-    response = s3.get_object(
-        Bucket=bucket_name,
-        Key=file_name
-    )
+        response = s3.get_object(
+            Bucket=bucket_name,
+            Key=file_name
+        )
 
-    data = response[
-        "Body"
-    ].read()
+        data = response[
+            "Body"
+        ].read()
+
+    except Exception as e:
+
+        print(
+            f"ERROR downloading "
+            f"{bucket_name}/{file_name}: {e}",
+            flush=True
+        )
+
+        return False
 
     print(
         f"Downloaded {len(data)} bytes.",
         flush=True
     )
-
-    # ========================================================
-    # FORMAT
-    # ========================================================
 
     lower_name = file_name.lower()
 
@@ -3459,38 +3228,15 @@ def process_file(
         ".csv"
     ):
 
-        print(
-            "Detected extension: CSV",
-            flush=True
-        )
-
         rows = parse_cdc_csv(
             data,
             file_name
         )
 
-    elif lower_name.endswith(
-        ".jsonl"
+    elif (
+        lower_name.endswith(".jsonl")
+        or lower_name.endswith(".ndjson")
     ):
-
-        print(
-            "Detected extension: JSONL / NDJSON",
-            flush=True
-        )
-
-        rows = parse_jsonl(
-            data,
-            file_name
-        )
-
-    elif lower_name.endswith(
-        ".ndjson"
-    ):
-
-        print(
-            "Detected extension: NDJSON",
-            flush=True
-        )
 
         rows = parse_jsonl(
             data,
@@ -3500,11 +3246,6 @@ def process_file(
     elif lower_name.endswith(
         ".json"
     ):
-
-        print(
-            "Detected extension: JSON / JSONL / NDJSON",
-            flush=True
-        )
 
         rows = parse_cdc_json(
             data,
@@ -3521,13 +3262,9 @@ def process_file(
         return False
 
     print(
-        f"Parsed {len(rows)} events.",
+        f"Parsed {len(rows)} CDC events.",
         flush=True
     )
-
-    # ========================================================
-    # NEVER MARK EMPTY PARSE AS PROCESSED
-    # ========================================================
 
     if not rows:
 
@@ -3542,20 +3279,11 @@ def process_file(
         )
 
         print(
-            "The file will NOT be marked as processed.",
-            flush=True
-        )
-
-        print(
-            "It will be retried on the next scan.",
+            "File will NOT be marked processed.",
             flush=True
         )
 
         return False
-
-    # ========================================================
-    # DATABASE
-    # ========================================================
 
     conn = get_db_connection()
 
@@ -3573,61 +3301,20 @@ def process_file(
 
         file_changed = (
             previous_etag is not None
-            and
-            previous_etag != etag
+            and previous_etag != etag
         )
-
-        force_rebuild = FORCE_REPROCESS
 
         repair_empty_file = (
             previous_etag is not None
-            and
-            previous_etag == etag
-            and
-            existing_event_count == 0
+            and previous_etag == etag
+            and existing_event_count == 0
         )
-
-        # ====================================================
-        # REBUILD WHEN NEEDED
-        # ====================================================
 
         if (
             file_changed
-            or force_rebuild
+            or FORCE_REPROCESS
             or repair_empty_file
         ):
-
-            print(
-                "",
-                flush=True
-            )
-
-            print(
-                "Rebuilding CDC events for file.",
-                flush=True
-            )
-
-            if file_changed:
-
-                print(
-                    "Reason: ETag changed.",
-                    flush=True
-                )
-
-            elif force_rebuild:
-
-                print(
-                    "Reason: FORCE_REPROCESS=true.",
-                    flush=True
-                )
-
-            elif repair_empty_file:
-
-                print(
-                    "Reason: Previously processed but "
-                    "zero CDC rows existed.",
-                    flush=True
-                )
 
             deleted_count = delete_file_events(
                 conn,
@@ -3636,14 +3323,9 @@ def process_file(
             )
 
             print(
-                f"Deleted old CDC events: "
-                f"{deleted_count}",
+                f"Deleted old CDC events: {deleted_count}",
                 flush=True
             )
-
-        # ====================================================
-        # INSERT
-        # ====================================================
 
         (
             inserted_count,
@@ -3655,10 +3337,6 @@ def process_file(
             file_name,
             etag
         )
-
-        # ====================================================
-        # VERIFY BEFORE COMMIT
-        # ====================================================
 
         cursor = conn.cursor()
 
@@ -3684,19 +3362,10 @@ def process_file(
         if final_count == 0:
 
             raise RuntimeError(
-                "Insert completed but database still "
-                "contains ZERO CDC events for this file."
+                "File processing produced zero database events."
             )
 
-        # ====================================================
-        # COMMIT
-        # ====================================================
-
         conn.commit()
-
-        # ====================================================
-        # SUCCESS
-        # ====================================================
 
         print(
             "",
@@ -3704,13 +3373,17 @@ def process_file(
         )
 
         print(
-            "================================================",
+            "SUCCESS",
             flush=True
         )
 
         print(
-            f"SUCCESS: "
-            f"{bucket_name}/{file_name}",
+            f"Bucket          : {bucket_name}",
+            flush=True
+        )
+
+        print(
+            f"File            : {file_name}",
             flush=True
         )
 
@@ -3734,11 +3407,6 @@ def process_file(
             flush=True
         )
 
-        print(
-            "================================================",
-            flush=True
-        )
-
         return True
 
     except Exception as e:
@@ -3752,12 +3420,11 @@ def process_file(
 
         print(
             f"ERROR processing "
-            f"{bucket_name}/{file_name}: "
-            f"{e}",
+            f"{bucket_name}/{file_name}: {e}",
             flush=True
         )
 
-        raise
+        return False
 
     finally:
 
@@ -3765,16 +3432,12 @@ def process_file(
 
 
 # ============================================================
-# GET BUCKET LIST
+# GET MINIO BUCKETS
 # ============================================================
 
 def get_minio_buckets():
 
     configured_buckets = get_configured_buckets()
-
-    # ========================================================
-    # EXPLICIT BUCKET CONFIGURATION
-    # ========================================================
 
     if configured_buckets:
 
@@ -3784,7 +3447,7 @@ def get_minio_buckets():
         )
 
         print(
-            "Using explicitly configured MinIO buckets:",
+            "Using configured buckets:",
             flush=True
         )
 
@@ -3797,10 +3460,6 @@ def get_minio_buckets():
 
         return configured_buckets
 
-    # ========================================================
-    # AUTOMATIC DISCOVERY
-    # ========================================================
-
     print(
         "",
         flush=True
@@ -3812,8 +3471,7 @@ def get_minio_buckets():
     )
 
     print(
-        "Discovering all buckets accessible "
-        "by the configured MinIO credentials...",
+        "Discovering all accessible MinIO buckets...",
         flush=True
     )
 
@@ -3851,7 +3509,7 @@ def get_minio_buckets():
     if not buckets:
 
         print(
-            "  No buckets found.",
+            "  NO BUCKETS FOUND",
             flush=True
         )
 
@@ -3906,9 +3564,9 @@ def scan_bucket(
 
     total_objects = 0
     supported_files = 0
-    processed_this_bucket = 0
-    skipped_this_bucket = 0
-    failed_this_bucket = 0
+    processed_count = 0
+    skipped_count = 0
+    failed_count = 0
 
     print(
         "",
@@ -3916,39 +3574,28 @@ def scan_bucket(
     )
 
     print(
-        "################################################",
+        "############################################################",
         flush=True
     )
 
     print(
-        f"BUCKET SCAN START: {bucket_name}",
+        f"BUCKET SCAN: {bucket_name}",
         flush=True
     )
 
     print(
-        f"MinIO prefix: "
-        f"{MINIO_PREFIX or '(entire bucket)'}",
+        f"Prefix: {MINIO_PREFIX or '(entire bucket)'}",
         flush=True
     )
 
     print(
-        "################################################",
+        "############################################################",
         flush=True
     )
-
-    # ========================================================
-    # CHECK ACCESS
-    # ========================================================
 
     if not check_bucket_access(
         bucket_name
     ):
-
-        print(
-            f"Skipping inaccessible bucket: "
-            f"{bucket_name}",
-            flush=True
-        )
 
         return {
             "objects": 0,
@@ -3958,19 +3605,13 @@ def scan_bucket(
             "failed": 1,
         }
 
-    # ========================================================
-    # PAGINATED OBJECT SCAN
-    # ========================================================
-
     while True:
 
         request = {
-
             "Bucket":
                 bucket_name,
-
             "Prefix":
-                MINIO_PREFIX
+                MINIO_PREFIX,
         }
 
         if continuation_token:
@@ -3979,9 +3620,23 @@ def scan_bucket(
                 "ContinuationToken"
             ] = continuation_token
 
-        response = s3.list_objects_v2(
-            **request
-        )
+        try:
+
+            response = s3.list_objects_v2(
+                **request
+            )
+
+        except Exception as e:
+
+            print(
+                f"ERROR listing bucket "
+                f"{bucket_name}: {e}",
+                flush=True
+            )
+
+            failed_count += 1
+
+            break
 
         objects = response.get(
             "Contents",
@@ -3994,13 +3649,13 @@ def scan_bucket(
 
         for obj in objects:
 
-            file_name = obj[
+            file_name = obj.get(
                 "Key"
-            ]
+            )
 
-            # ------------------------------------------------
-            # Ignore directories
-            # ------------------------------------------------
+            if not file_name:
+
+                continue
 
             if file_name.endswith(
                 "/"
@@ -4010,35 +3665,13 @@ def scan_bucket(
 
             lower_name = file_name.lower()
 
-            # ------------------------------------------------
-            # Supported files
-            # ------------------------------------------------
-
-            if not (
-                lower_name.endswith(
-                    ".csv"
-                )
-                or
-                lower_name.endswith(
-                    ".json"
-                )
-                or
-                lower_name.endswith(
-                    ".jsonl"
-                )
-                or
-                lower_name.endswith(
-                    ".ndjson"
-                )
+            if not lower_name.endswith(
+                SUPPORTED_EXTENSIONS
             ):
 
                 continue
 
             supported_files += 1
-
-            # ------------------------------------------------
-            # ETAG
-            # ------------------------------------------------
 
             etag = (
                 obj.get(
@@ -4051,10 +3684,6 @@ def scan_bucket(
                 )
             )
 
-            # ------------------------------------------------
-            # DECIDE
-            # ------------------------------------------------
-
             try:
 
                 process_required = should_process_file(
@@ -4065,17 +3694,11 @@ def scan_bucket(
 
             except Exception as e:
 
-                failed_this_bucket += 1
-
-                print(
-                    "",
-                    flush=True
-                )
+                failed_count += 1
 
                 print(
                     f"ERROR checking "
-                    f"{bucket_name}/{file_name}: "
-                    f"{e}",
+                    f"{bucket_name}/{file_name}: {e}",
                     flush=True
                 )
 
@@ -4083,49 +3706,23 @@ def scan_bucket(
 
             if not process_required:
 
-                skipped_this_bucket += 1
+                skipped_count += 1
 
                 continue
 
-            # ------------------------------------------------
-            # PROCESS
-            # ------------------------------------------------
+            success = process_file(
+                bucket_name,
+                file_name,
+                etag
+            )
 
-            try:
+            if success:
 
-                success = process_file(
-                    bucket_name,
-                    file_name,
-                    etag
-                )
+                processed_count += 1
 
-                if success:
+            else:
 
-                    processed_this_bucket += 1
-
-                else:
-
-                    failed_this_bucket += 1
-
-            except Exception as e:
-
-                failed_this_bucket += 1
-
-                print(
-                    "",
-                    flush=True
-                )
-
-                print(
-                    f"ERROR processing "
-                    f"{bucket_name}/{file_name}: "
-                    f"{e}",
-                    flush=True
-                )
-
-        # ----------------------------------------------------
-        # PAGINATION
-        # ----------------------------------------------------
+                failed_count += 1
 
         if not response.get(
             "IsTruncated",
@@ -4142,57 +3739,48 @@ def scan_bucket(
 
             break
 
-    # ========================================================
-    # BUCKET SUMMARY
-    # ========================================================
-
     print(
         "",
         flush=True
     )
 
     print(
-        "################################################",
+        "############################################################",
         flush=True
     )
 
     print(
-        f"BUCKET SCAN COMPLETE: {bucket_name}",
+        f"BUCKET COMPLETE: {bucket_name}",
         flush=True
     )
 
     print(
-        f"Objects             : "
-        f"{total_objects}",
+        f"Objects          : {total_objects}",
         flush=True
     )
 
     print(
-        f"Supported files     : "
-        f"{supported_files}",
+        f"Supported files  : {supported_files}",
         flush=True
     )
 
     print(
-        f"Processed            : "
-        f"{processed_this_bucket}",
+        f"Processed        : {processed_count}",
         flush=True
     )
 
     print(
-        f"Already processed    : "
-        f"{skipped_this_bucket}",
+        f"Skipped          : {skipped_count}",
         flush=True
     )
 
     print(
-        f"Failed / retry       : "
-        f"{failed_this_bucket}",
+        f"Failed           : {failed_count}",
         flush=True
     )
 
     print(
-        "################################################",
+        "############################################################",
         flush=True
     )
 
@@ -4204,18 +3792,18 @@ def scan_bucket(
             supported_files,
 
         "processed":
-            processed_this_bucket,
+            processed_count,
 
         "skipped":
-            skipped_this_bucket,
+            skipped_count,
 
         "failed":
-            failed_this_bucket,
+            failed_count,
     }
 
 
 # ============================================================
-# SCAN ALL MINIO BUCKETS
+# SCAN ALL MINIO
 # ============================================================
 
 def scan_minio():
@@ -4226,7 +3814,7 @@ def scan_minio():
     )
 
     print(
-        "================================================",
+        "============================================================",
         flush=True
     )
 
@@ -4236,31 +3824,14 @@ def scan_minio():
     )
 
     print(
-        f"MinIO endpoint: "
-        f"{MINIO_ENDPOINT}",
+        f"Endpoint: {MINIO_ENDPOINT}",
         flush=True
     )
 
     print(
-        f"MinIO prefix: "
-        f"{MINIO_PREFIX or '(entire bucket)'}",
+        "============================================================",
         flush=True
     )
-
-    print(
-        f"Force reprocess: "
-        f"{FORCE_REPROCESS}",
-        flush=True
-    )
-
-    print(
-        "================================================",
-        flush=True
-    )
-
-    # ========================================================
-    # GET BUCKETS
-    # ========================================================
 
     try:
 
@@ -4269,61 +3840,28 @@ def scan_minio():
     except Exception as e:
 
         print(
-            "",
-            flush=True
-        )
-
-        print(
-            f"ERROR discovering MinIO buckets: "
-            f"{e}",
+            f"ERROR discovering MinIO buckets: {e}",
             flush=True
         )
 
         return
-
-    # ========================================================
-    # NO BUCKETS
-    # ========================================================
 
     if not buckets:
 
         print(
-            "",
-            flush=True
-        )
-
-        print(
-            "WARNING: No MinIO buckets available.",
+            "WARNING: No accessible MinIO buckets.",
             flush=True
         )
 
         return
 
-    # ========================================================
-    # GLOBAL COUNTERS
-    # ========================================================
-
     totals = {
-
-        "objects":
-            0,
-
-        "supported":
-            0,
-
-        "processed":
-            0,
-
-        "skipped":
-            0,
-
-        "failed":
-            0,
+        "objects": 0,
+        "supported": 0,
+        "processed": 0,
+        "skipped": 0,
+        "failed": 0,
     }
-
-    # ========================================================
-    # SCAN EACH BUCKET
-    # ========================================================
 
     for bucket_name in buckets:
 
@@ -4335,9 +3873,7 @@ def scan_minio():
 
             for key in totals:
 
-                totals[
-                    key
-                ] += result.get(
+                totals[key] += result.get(
                     key,
                     0
                 )
@@ -4349,19 +3885,10 @@ def scan_minio():
             ] += 1
 
             print(
-                "",
-                flush=True
-            )
-
-            print(
                 f"ERROR scanning bucket "
                 f"'{bucket_name}': {e}",
                 flush=True
             )
-
-    # ========================================================
-    # GLOBAL SUMMARY
-    # ========================================================
 
     print(
         "",
@@ -4369,53 +3896,47 @@ def scan_minio():
     )
 
     print(
-        "================================================",
+        "============================================================",
         flush=True
     )
 
     print(
-        "MULTI-BUCKET MINIO SCAN COMPLETE",
+        "MINIO MULTI-BUCKET SCAN COMPLETE",
         flush=True
     )
 
     print(
-        f"Buckets scanned      : "
-        f"{len(buckets)}",
+        f"Buckets scanned : {len(buckets)}",
         flush=True
     )
 
     print(
-        f"Objects              : "
-        f"{totals['objects']}",
+        f"Objects         : {totals['objects']}",
         flush=True
     )
 
     print(
-        f"Supported files      : "
-        f"{totals['supported']}",
+        f"Supported files : {totals['supported']}",
         flush=True
     )
 
     print(
-        f"Processed this scan  : "
-        f"{totals['processed']}",
+        f"Processed       : {totals['processed']}",
         flush=True
     )
 
     print(
-        f"Already processed    : "
-        f"{totals['skipped']}",
+        f"Skipped         : {totals['skipped']}",
         flush=True
     )
 
     print(
-        f"Failed / retry       : "
-        f"{totals['failed']}",
+        f"Failed          : {totals['failed']}",
         flush=True
     )
 
     print(
-        "================================================",
+        "============================================================",
         flush=True
     )
 
@@ -4426,110 +3947,10 @@ def scan_minio():
 
 def main():
 
-    print(
-        "",
-        flush=True
-    )
-
-    print(
-        "================================================",
-        flush=True
-    )
-
-    print(
-        "CDC PYTHON MULTI-BUCKET WORKER",
-        flush=True
-    )
-
-    print(
-        "================================================",
-        flush=True
-    )
-
-    print(
-        f"MinIO endpoint : "
-        f"{MINIO_ENDPOINT}",
-        flush=True
-    )
+    print_configuration()
 
     # ========================================================
-    # BUCKET MODE
-    # ========================================================
-
-    configured_buckets = get_configured_buckets()
-
-    if configured_buckets:
-
-        print(
-            "Bucket mode    : EXPLICIT",
-            flush=True
-        )
-
-        print(
-            "Buckets        : "
-            + ", ".join(
-                configured_buckets
-            ),
-            flush=True
-        )
-
-    else:
-
-        print(
-            "Bucket mode    : AUTO DISCOVERY",
-            flush=True
-        )
-
-        print(
-            "Buckets        : ALL ACCESSIBLE BUCKETS",
-            flush=True
-        )
-
-    print(
-        f"MinIO prefix   : "
-        f"{MINIO_PREFIX or '(entire bucket)'}",
-        flush=True
-    )
-
-    print(
-        f"PostgreSQL     : "
-        f"{POSTGRES_HOST}:"
-        f"{POSTGRES_PORT}/"
-        f"{POSTGRES_DB}",
-        flush=True
-    )
-
-    print(
-        f"Poll interval  : "
-        f"{POLL_INTERVAL} seconds",
-        flush=True
-    )
-
-    print(
-        "Supported files: "
-        "CSV / JSON / JSONL / NDJSON",
-        flush=True
-    )
-
-    print(
-        "Supported CSV: "
-        "Simple CDC + Kafka CDC",
-        flush=True
-    )
-
-    print(
-        f"Force reprocess: "
-        f"{FORCE_REPROCESS}",
-        flush=True
-    )
-
-    print(
-        "================================================",
-        flush=True
-    )
-
-    # ========================================================
-    # DATABASE INITIALIZATION
+    # DATABASE RETRY
     # ========================================================
 
     while True:
@@ -4548,19 +3969,47 @@ def main():
             )
 
             print(
-                f"Database initialization failed: "
-                f"{e}",
+                f"Database initialization failed: {e}",
                 flush=True
             )
 
             print(
-                "Retrying in 5 seconds...",
+                "Retrying database in 5 seconds...",
                 flush=True
             )
 
             time.sleep(
                 5
             )
+
+    # ========================================================
+    # MINIO RETRY
+    # ========================================================
+
+    while True:
+
+        if test_minio_connection():
+
+            break
+
+        print(
+            "",
+            flush=True
+        )
+
+        print(
+            "MinIO is not reachable/authentication failed.",
+            flush=True
+        )
+
+        print(
+            "Retrying MinIO connection in 10 seconds...",
+            flush=True
+        )
+
+        time.sleep(
+            10
+        )
 
     # ========================================================
     # CONTINUOUS POLLING
@@ -4580,8 +4029,7 @@ def main():
             )
 
             print(
-                f"ERROR during MinIO scan: "
-                f"{e}",
+                f"ERROR during MinIO scan: {e}",
                 flush=True
             )
 

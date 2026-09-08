@@ -163,8 +163,7 @@ services:
   # ============================================================
 
   python-worker:
-    build:
-      context: ./python
+    image: cdc-dashboard-python-worker:latest
 
     container_name: cdc-python-worker
 
@@ -211,8 +210,7 @@ services:
   # ============================================================
 
   file-picker:
-    build:
-      context: ./file-picker
+    image: cdc-dashboard-file-picker:latest
 
     container_name: cdc-file-picker
 
@@ -237,6 +235,7 @@ services:
       # ----------------------------------------------------------
 
       REDASH_URL: ${REDASH_URL}
+      REDASH_DASHBOARD_PATH: ${REDASH_DASHBOARD_PATH}
 
     ports:
       - "7000:7000"
